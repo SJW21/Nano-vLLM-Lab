@@ -1,5 +1,8 @@
-from dataclasses import dataclass
+import os
+import sys
 import torch
+import contextlib
+from dataclasses import dataclass
 
 
 @dataclass(slots=True)
@@ -25,3 +28,28 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
 def reset_context():
     global _CONTEXT
     _CONTEXT = Context()
+
+
+@contextlib.contextmanager
+def suppress_stdout():
+    """
+    Suppress stdout from C libraries at the file descriptor level.
+    """
+    # Don't suppress if logging level is DEBUG
+    if os.environ.get('VLLM_LOGGING_LEVEL', 'NORMAL') == "DEBUG":
+        yield
+        return
+    
+    stdout_fd = sys.stdout.fileno()
+    stdout_dup = os.dup(stdout_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+
+    try:
+        sys.stdout.flush()
+        os.dup2(devnull_fd, stdout_fd)
+        yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(stdout_dup, stdout_fd)
+        os.close(stdout_dup)
+        os.close(devnull_fd)

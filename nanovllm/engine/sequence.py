@@ -1,6 +1,7 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+from dataclasses import dataclass
 
 from nanovllm.sampling_params import SamplingParams
 
@@ -11,12 +12,32 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 
+class SequenceManager:
+    # sequence id counter
+    def __init__(self):
+        self.counter = count()
+    
+    @property
+    def get_id(self):
+        return next(self.counter)
+
+
+@dataclass
+class TokenizedInput:
+    # token_ids
+    token_ids: list[int]
+    # id of sequence
+    seq_id: int
+    # Params for Sampler
+    sampling_params: SamplingParams
+
+
 class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
-        self.seq_id = next(Sequence.counter)
+    def __init__(self, token_ids: list[int], seq_id: int, sampling_params = SamplingParams()):
+        self.seq_id = seq_id
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]

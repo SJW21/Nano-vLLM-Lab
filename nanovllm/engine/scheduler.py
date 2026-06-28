@@ -68,7 +68,7 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
+        assert scheduled_seqs or self.is_finished()
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
@@ -86,7 +86,8 @@ class Scheduler:
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            # [BUGFIX] CUDA Graph Buffer max size is set to "max_tokens" not "prompt_len + completed_len" 
+            if (not seq.ignore_eos and token_id == self.eos) or len(seq) == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)

@@ -7,9 +7,11 @@ import torch.multiprocessing as mp
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
+from nanovllm.engine.sequence import TokenizedInput, SequenceManager
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.data_parallel_controller import DataParallelController
 
 
 class LLMEngine:
@@ -24,11 +26,11 @@ class LLMEngine:
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process = ctx.Process(target=ModelRunner, args=(config, i, 0, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.model_runner = ModelRunner(config, 0, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
@@ -43,7 +45,7 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+        seq = Sequence(prompt, next(Sequence.counter), sampling_params)
         self.scheduler.add(seq)
 
     def step(self):
@@ -88,3 +90,63 @@ class LLMEngine:
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         return outputs
+
+
+class DPLLMEngine:
+    """
+    DP LLM Engine offline inference
+    """
+    def __init__(self, model, **kwargs):
+        config_fields = {field.name for field in fields(Config)}
+        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+        config = Config(model, **config_kwargs)
+        self.dp_controller = DataParallelController(config)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.seqm = SequenceManager()
+        config.eos = self.tokenizer.eos_token_id
+        atexit.register(self.exit)
+    
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        if isinstance(prompt, str):
+            prompt = self.tokenizer.encode(prompt)
+        seq = TokenizedInput(prompt, self.seqm.get_id, sampling_params)
+        self.dp_controller.dispatcher(seq)
+
+    def generate(
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+        use_tqdm: bool = True,
+    ):
+        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+        for prompt, sp in zip(prompts, sampling_params):
+            self.add_request(prompt, sp)
+        outputs = {}
+        self.dp_controller.Res_Budget = outputs
+        num_token_finished = 0
+        num_req_finished = 0
+        output_throughput = 0.
+        t0 = perf_counter()
+        while len(outputs) < len(prompts):
+            num_tokens = self.dp_controller.res_recv_from_client()
+            num_token_finished += num_tokens
+
+            if num_tokens > 0:
+                output_throughput = num_token_finished / (perf_counter() - t0)
+                pbar.set_postfix({
+                    "Throughput": f"{int(output_throughput)}tok/s"
+                })
+                pbar.update(len(outputs) - num_req_finished)
+            num_req_finished = len(outputs)
+        
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        pbar.close()
+
+        return outputs
+
+    def exit(self):
+        self.dp_controller.call("exit")
+        del self.dp_controller

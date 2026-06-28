@@ -10,20 +10,27 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.distributed.parallel_state import (init_distributed_environment,
+                                                 initialize_model_parallel)
 
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, tar_rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
+        self.tp_size = config.tensor_parallel_size
+        self.dp_size = config.data_parallel_size
+        self.world_size = self.dp_size * self.tp_size
         self.rank = rank
+        self.target_rank = tar_rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        init_distributed_environment(self.world_size, self.rank, backend="nccl")
+        initialize_model_parallel(self.world_size, tensor_parallel_size=self.tp_size,
+                                  data_parallel_size=self.dp_size)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
@@ -38,20 +45,21 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+        if self.tp_size > 1:
+            dp_id = self.target_rank // self.tp_size
+            if rank == self.target_rank:
+                self.shm = SharedMemory(name=f"nanovllm_dp_{dp_id}", create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name=f"nanovllm_dp_{dp_id}")
                 self.loop()
 
     def exit(self):
-        if self.world_size > 1:
+        if self.tp_size > 1:
             self.shm.close()
             dist.barrier()
-            if self.rank == 0:
+            if self.rank == self.target_rank:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
@@ -66,7 +74,7 @@ class ModelRunner:
                 break
 
     def read_shm(self):
-        assert self.world_size > 1 and self.rank > 0
+        assert self.tp_size > 1 and self.rank != self.target_rank
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
@@ -74,7 +82,7 @@ class ModelRunner:
         return method_name, args
 
     def write_shm(self, method_name, *args):
-        assert self.world_size > 1 and self.rank == 0
+        assert self.tp_size > 1 and self.rank == self.target_rank
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
@@ -83,7 +91,7 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:
+        if self.tp_size > 1 and self.rank == self.target_rank:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
@@ -94,7 +102,7 @@ class ModelRunner:
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
+        seqs = [Sequence([0] * seq_len, -1) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
@@ -107,7 +115,7 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads = hf_config.num_key_value_heads // self.tp_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
@@ -213,9 +221,9 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        temperatures = self.prepare_sample(seqs) if self.rank == self.target_rank else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == self.target_rank else None
         reset_context()
         return token_ids
 
