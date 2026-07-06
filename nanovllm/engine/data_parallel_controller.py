@@ -28,6 +28,8 @@ class DPClient:
         self.rank = target_rank
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.data_parallel_size
+        # [CHECK] uneffective in simple offline test, maybe further check in future.
+        self.async_event_loop = config.async_event_loop
 
         # set tp worker
         self.ps = []
@@ -91,16 +93,75 @@ class DPClient:
             self.exit()
 
     def event_loop(self):
-        #[TODO] Async recv/execute/send in future
+        if self.async_event_loop:
+            self._event_loop_async()
+        else:
+            self._event_loop_sync()
+
+    def _event_loop_sync(self):
         while True:
-            # recv req
             self.recv_request()
             if not self.handling:
                 break
             outputs = self.step()
-            # return result once inference has finished
             if outputs:
                 send_with_backpressure(self.send_to_control, outputs)
+
+    def _event_loop_async(self):
+        import threading
+        import queue
+
+        result_queue = queue.Queue()
+        wake_event = threading.Event()
+        sched_lock = threading.Lock()
+
+        def recv_loop():
+            while self.handling:
+                try:
+                    if self.recv_from_router.poll(100):
+                        recv_req = self.recv_from_router.recv_multipart()
+                        with sched_lock:
+                            self.req_dispatcher(recv_req[-1])
+                        wake_event.set()
+                except zmq.ZMQError:
+                    continue
+
+        def send_loop():
+            while self.handling:
+                try:
+                    outputs = result_queue.get(timeout=0.1)
+                    send_with_backpressure(self.send_to_control, outputs)
+                except queue.Empty:
+                    continue
+            # Makesure all requests have been sent when exit
+            while True:
+                try:
+                    outputs = result_queue.get_nowait()
+                    send_with_backpressure(self.send_to_control, outputs)
+                except queue.Empty:
+                    break
+
+        recv_t = threading.Thread(target=recv_loop, daemon=True)
+        send_t = threading.Thread(target=send_loop, daemon=True)
+        recv_t.start()
+        send_t.start()
+
+        while self.handling:
+            with sched_lock:
+                seqs, is_prefill = self.scheduler.schedule()
+            if seqs:
+                token_ids = self.model_runner.call("run", seqs, is_prefill)
+                with sched_lock:
+                    self.scheduler.postprocess(seqs, token_ids, is_prefill)
+                for seq in seqs:
+                    if seq.is_finished:
+                        result_queue.put([(seq.seq_id, seq.completion_token_ids)])
+            else:
+                wake_event.wait(timeout=0.5)
+
+        recv_t.join(timeout=5)
+        send_t.join(timeout=5)
+        self.exit()
 
     def add_request(self, seq: Sequence):
         self.scheduler.add(seq)
@@ -109,7 +170,7 @@ class DPClient:
         seqs, is_prefill = self.scheduler.schedule()
         if seqs:
             token_ids = self.model_runner.call("run", seqs, is_prefill)
-            self.scheduler.postprocess(seqs, token_ids)
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
             outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         else:
             #[TODO] add IDLE sync
@@ -148,6 +209,7 @@ class DataParallelController:
         ):
         self.dp_size = config.data_parallel_size
         self.tp_size = config.tensor_parallel_size
+        self.dplb_method = config.dplb_method
         # 1. build communication socket
         # 1 thread for result receive / dp_size thread for request router
         context = zmq.Context(io_threads=2)
@@ -200,17 +262,31 @@ class DataParallelController:
         print("[Logger] All DPClients have registered successfully.")
 
     def init_req_dispatcher(self, method: str):
-        function_map = {"ROUND_ROBIN": self.round_robin_scheduler}
+        function_map = {
+            "ROUND_ROBIN": self.round_robin_scheduler,
+            "LEAST_REQUESTS": self.least_requests_scheduler,
+        }
         assert method in function_map, f'Dispatch method {method} has not been supported yet.'
-        self.dispatcher = function_map.get(method)
+        self.dispatcher = function_map[method]
         if method == "ROUND_ROBIN":
             self.robin_counter = 0
+        elif method == "LEAST_REQUESTS":
+            self.inflight_counts = [0] * self.dp_size
+            self.seq_to_client: dict[int, int] = {}
 
     def round_robin_scheduler(self, seq: TokenizedInput):
         target_ids = self.dp_ids[self.robin_counter]
         seq_bytes = pickle.dumps(seq)
         self.router_socket.send_multipart([target_ids, seq_bytes])
         self.robin_counter = (self.robin_counter + 1) % self.dp_size
+
+    def least_requests_scheduler(self, seq: TokenizedInput):
+        idx = min(range(self.dp_size), key=lambda i: self.inflight_counts[i])
+        self.seq_to_client[seq.seq_id] = idx
+        self.inflight_counts[idx] += 1
+        target_ids = self.dp_ids[idx]
+        seq_bytes = pickle.dumps(seq)
+        self.router_socket.send_multipart([target_ids, seq_bytes])
 
     def res_recv_from_client(self):
         num_tokens = 0
@@ -220,6 +296,9 @@ class DataParallelController:
                 for seq_id, token_ids in generate_res:
                     self.Res_Budget[seq_id] = token_ids
                     num_tokens += len(token_ids)
+                    if self.dplb_method == "LEAST_REQUESTS":
+                        idx = self.seq_to_client.pop(seq_id)
+                        self.inflight_counts[idx] -= 1
             except zmq.ZMQError:
                 break
         return num_tokens

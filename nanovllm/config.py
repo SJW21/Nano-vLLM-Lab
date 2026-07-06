@@ -18,6 +18,7 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     dplb_method: str = "ROUND_ROBIN"
+    async_event_loop: bool = False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
