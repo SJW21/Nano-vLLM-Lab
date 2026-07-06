@@ -1,5 +1,5 @@
 import atexit
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -14,12 +14,22 @@ from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.data_parallel_controller import DataParallelController
 
 
+@dataclass
+class FailedRequest:
+    prompt_len: int
+    max_tokens: int
+    max_model_len: int
+    reason: str
+
+
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
+        self.failed: list[FailedRequest] = []
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -45,6 +55,20 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        prompt_len = len(prompt)
+        if prompt_len == 0:
+            self.failed.append(FailedRequest(
+                prompt_len, sampling_params.max_tokens,
+                self.config.max_model_len, "empty prompt"))
+            return
+        if prompt_len + sampling_params.max_tokens > self.config.max_model_len:
+            self.failed.append(FailedRequest(
+                prompt_len, sampling_params.max_tokens,
+                self.config.max_model_len,
+                f"prompt_len ({prompt_len}) + max_tokens ({sampling_params.max_tokens})"
+                f" = {prompt_len + sampling_params.max_tokens}"
+                f" exceeds max_model_len ({self.config.max_model_len})"))
+            return
         seq = Sequence(prompt, next(Sequence.counter), sampling_params)
         self.scheduler.add(seq)
 
@@ -65,11 +89,13 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
-        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        self.failed = []
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
+        num_valid = len(prompts) - len(self.failed)
+        pbar = tqdm(total=num_valid, desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
@@ -87,6 +113,10 @@ class LLMEngine:
                 outputs[seq_id] = token_ids
                 pbar.update(1)
         pbar.close()
+        if self.failed:
+            print(f"\n[WARNING] {len(self.failed)}/{len(prompts)} request(s) rejected:")
+            for i, f in enumerate(self.failed):
+                print(f"  [{i+1}] {f.reason}")
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         return outputs
@@ -100,6 +130,8 @@ class DPLLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
+        self.failed: list[FailedRequest] = []
         self.dp_controller = DataParallelController(config)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         self.seqm = SequenceManager()
@@ -109,6 +141,20 @@ class DPLLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        prompt_len = len(prompt)
+        if prompt_len == 0:
+            self.failed.append(FailedRequest(
+                prompt_len, sampling_params.max_tokens,
+                self.config.max_model_len, "empty prompt"))
+            return
+        if prompt_len + sampling_params.max_tokens > self.config.max_model_len:
+            self.failed.append(FailedRequest(
+                prompt_len, sampling_params.max_tokens,
+                self.config.max_model_len,
+                f"prompt_len ({prompt_len}) + max_tokens ({sampling_params.max_tokens})"
+                f" = {prompt_len + sampling_params.max_tokens}"
+                f" exceeds max_model_len ({self.config.max_model_len})"))
+            return
         seq = TokenizedInput(prompt, self.seqm.get_id, sampling_params)
         self.dp_controller.dispatcher(seq)
 
@@ -118,18 +164,20 @@ class DPLLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ):
-        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        self.failed = []
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
+        num_valid = len(prompts) - len(self.failed)
+        pbar = tqdm(total=num_valid, desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         outputs = {}
         self.dp_controller.Res_Budget = outputs
         num_token_finished = 0
         num_req_finished = 0
         output_throughput = 0.
         t0 = perf_counter()
-        while len(outputs) < len(prompts):
+        while len(outputs) < num_valid:
             num_tokens = self.dp_controller.res_recv_from_client()
             num_token_finished += num_tokens
 
@@ -141,9 +189,13 @@ class DPLLMEngine:
                 pbar.update(len(outputs) - num_req_finished)
             num_req_finished = len(outputs)
         
+        pbar.close()
+        if self.failed:
+            print(f"\n[WARNING] {len(self.failed)}/{len(prompts)} request(s) rejected:")
+            for i, f in enumerate(self.failed):
+                print(f"  [{i+1}] {f.reason}")
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
-        pbar.close()
 
         return outputs
 
