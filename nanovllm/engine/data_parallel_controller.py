@@ -10,6 +10,7 @@ from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import Sequence, TokenizedInput
 from nanovllm.utils.network import get_zmq_socket, NetworkConfig, send_with_backpressure
+from nanovllm.utils.profiler import Profiler
 
 
 class DPClient:
@@ -45,6 +46,8 @@ class DPClient:
 
         # init scheduler
         self.scheduler = Scheduler(config)
+        # init profiler
+        self.profiler = Profiler(config, rank=self.rank)
         # init tcp socket
         self.init_tcp_socket(net_config)
         self.handling = True
@@ -99,13 +102,14 @@ class DPClient:
             self._event_loop_sync()
 
     def _event_loop_sync(self):
-        while True:
-            self.recv_request()
-            if not self.handling:
-                break
-            outputs = self.step()
-            if outputs:
-                send_with_backpressure(self.send_to_control, outputs)
+        with self.profiler:
+            while True:
+                self.recv_request()
+                if not self.handling:
+                    break
+                outputs = self.step()
+                if outputs:
+                    send_with_backpressure(self.send_to_control, outputs)
 
     def _event_loop_async(self):
         import threading
@@ -146,18 +150,20 @@ class DPClient:
         recv_t.start()
         send_t.start()
 
-        while self.handling:
-            with sched_lock:
-                seqs, is_prefill = self.scheduler.schedule()
-            if seqs:
-                token_ids = self.model_runner.call("run", seqs, is_prefill)
+        with self.profiler:
+            while self.handling:
                 with sched_lock:
-                    self.scheduler.postprocess(seqs, token_ids, is_prefill)
-                for seq in seqs:
-                    if seq.is_finished:
-                        result_queue.put([(seq.seq_id, seq.completion_token_ids)])
-            else:
-                wake_event.wait(timeout=0.5)
+                    seqs, is_prefill = self.scheduler.schedule()
+                if seqs:
+                    token_ids = self.model_runner.call("run", seqs, is_prefill)
+                    with sched_lock:
+                        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+                    self.profiler.step()
+                    for seq in seqs:
+                        if seq.is_finished:
+                            result_queue.put([(seq.seq_id, seq.completion_token_ids)])
+                else:
+                    wake_event.wait(timeout=0.5)
 
         recv_t.join(timeout=5)
         send_t.join(timeout=5)
@@ -171,6 +177,7 @@ class DPClient:
         if seqs:
             token_ids = self.model_runner.call("run", seqs, is_prefill)
             self.scheduler.postprocess(seqs, token_ids, is_prefill)
+            self.profiler.step()
             outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         else:
             #[TODO] add IDLE sync

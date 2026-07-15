@@ -17,8 +17,12 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
-    dplb_method: str = "ROUND_ROBIN"
+    dplb_method: str = "ROUND_ROBIN" # Option["LEAST_REQUESTS", "ROUND_ROBIN"]
     async_event_loop: bool = False
+    enable_profiler: bool = False
+    profiler_output: str = "./profiler_logs"
+    profiler_warmup_steps: int = 3 # skip num_steps before profile 
+    profiler_active_steps: int = 0 # num_steps to profile
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

@@ -14,7 +14,7 @@ A lightweight vLLM implementation built from scratch.
 
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+* ⚡ **Optimization Suite** - Data/Tensor Parallelism, Prefix caching, Torch compilation, CUDA graph, etc.
 
 ## Installation
 
@@ -26,8 +26,19 @@ pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 
 To download the model weights manually, use the following command:
 ```bash
+export HF_ENDPOINT=https://hf-mirror.com
 hf download Qwen/Qwen3-0.6B \
   --local-dir ./huggingface/Qwen3-0.6B/
+```
+
+or
+
+```bash
+pip install modelscope
+python -c "
+from modelscope import snapshot_download
+snapshot_download('Qwen/Qwen3-0.6B', cache_dir='./huggingface/Qwen3-0.6B/')
+"
 ```
 
 ## Quick Start

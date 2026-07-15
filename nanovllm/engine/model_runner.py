@@ -9,7 +9,9 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
+from torch.profiler import record_function
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.profiler import Profiler
 from nanovllm.distributed.parallel_state import (init_distributed_environment,
                                                  initialize_model_parallel)
 
@@ -67,11 +69,14 @@ class ModelRunner:
         dist.destroy_process_group()
 
     def loop(self):
-        while True:
-            method_name, args = self.read_shm()
-            self.call(method_name, *args)
-            if method_name == "exit":
-                break
+        profiler = Profiler(self.config, rank=self.rank)
+        with profiler:
+            while True:
+                method_name, args = self.read_shm()
+                self.call(method_name, *args)
+                if method_name == "exit":
+                    break
+                profiler.step()
 
     def read_shm(self):
         assert self.tp_size > 1 and self.rank != self.target_rank
@@ -220,10 +225,13 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == self.target_rank else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == self.target_rank else None
+        with record_function("prepare_inputs"):
+            input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+            temperatures = self.prepare_sample(seqs) if self.rank == self.target_rank else None
+        with record_function("model"):
+            logits = self.run_model(input_ids, positions, is_prefill)
+        with record_function("sample"):
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == self.target_rank else None
         reset_context()
         return token_ids
 

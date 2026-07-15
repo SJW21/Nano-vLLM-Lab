@@ -12,6 +12,7 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.data_parallel_controller import DataParallelController
+from nanovllm.utils.profiler import Profiler
 
 
 @dataclass
@@ -44,6 +45,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.profiler = Profiler(config)
         atexit.register(self.exit)
 
     def exit(self):
@@ -98,20 +100,22 @@ class LLMEngine:
         pbar = tqdm(total=num_valid, desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
-        while not self.is_finished():
-            t = perf_counter()
-            output, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
-            pbar.set_postfix({
-                "Prefill": f"{int(prefill_throughput)}tok/s",
-                "Decode": f"{int(decode_throughput)}tok/s",
-            })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
-                pbar.update(1)
+        with self.profiler:
+            while not self.is_finished():
+                t = perf_counter()
+                output, num_tokens = self.step()
+                self.profiler.step()
+                if num_tokens > 0:
+                    prefill_throughput = num_tokens / (perf_counter() - t)
+                else:
+                    decode_throughput = -num_tokens / (perf_counter() - t)
+                pbar.set_postfix({
+                    "Prefill": f"{int(prefill_throughput)}tok/s",
+                    "Decode": f"{int(decode_throughput)}tok/s",
+                })
+                for seq_id, token_ids in output:
+                    outputs[seq_id] = token_ids
+                    pbar.update(1)
         pbar.close()
         if self.failed:
             print(f"\n[WARNING] {len(self.failed)}/{len(prompts)} request(s) rejected:")
