@@ -4,9 +4,17 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
+# Bump torch.compile cache limit — a 48-layer MoE model has many compiled
+# functions (RMSNorm ×2 per layer + SiluAndMul × experts).  Default=8 is
+# easily exhausted, causing constant recompilation and this warning:
+#   "torch._dynamo hit config.cache_size_limit (8)"
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 256
+
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3_moe import Qwen3MoEForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from torch.profiler import record_function
@@ -22,6 +30,11 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
+        # EP mode requires eager execution (v0.2 limitation):
+        # dynamic all-to-all split sizes are incompatible with CUDA graphs.
+        self.ep_enabled = config.expert_parallel_size > 1
+        if self.ep_enabled:
+            config.enforce_eager = True
         self.enforce_eager = config.enforce_eager
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.data_parallel_size
@@ -32,13 +45,25 @@ class ModelRunner:
 
         init_distributed_environment(self.world_size, self.rank, backend="nccl")
         initialize_model_parallel(self.world_size, tensor_parallel_size=self.tp_size,
-                                  data_parallel_size=self.dp_size)
+                                  data_parallel_size=self.dp_size,
+                                  expert_parallel_size=config.expert_parallel_size)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+
+        # Model selection: MoE vs dense
+        is_moe = hf_config.model_type == "qwen3_moe"
+        if is_moe:
+            ep_size = config.expert_parallel_size
+            ep_rank = rank if ep_size > 1 else 0  # EP covers all ranks
+            self.model = Qwen3MoEForCausalLM(hf_config, ep_size, ep_rank, config.moe_mode)
+            load_model(self.model, config.model,
+                       ep_size=ep_size, ep_rank=ep_rank,
+                       num_experts=hf_config.num_experts)
+        else:
+            self.model = Qwen3ForCausalLM(hf_config)
+            load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()

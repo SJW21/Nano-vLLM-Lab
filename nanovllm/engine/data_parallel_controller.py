@@ -8,7 +8,7 @@ import pickle
 from nanovllm.config import Config
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.sequence import Sequence, TokenizedInput
+from nanovllm.engine.sequence import Sequence, SequenceStatus, TokenizedInput
 from nanovllm.utils.network import get_zmq_socket, NetworkConfig, send_with_backpressure
 from nanovllm.utils.profiler import Profiler
 
@@ -29,6 +29,7 @@ class DPClient:
         self.rank = target_rank
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.data_parallel_size
+        self.ep_enabled = config.expert_parallel_size > 1
         # [CHECK] uneffective in simple offline test, maybe further check in future.
         self.async_event_loop = config.async_event_loop
 
@@ -154,14 +155,19 @@ class DPClient:
             while self.handling:
                 with sched_lock:
                     seqs, is_prefill = self.scheduler.schedule()
+                if not seqs and self.ep_enabled:
+                    seqs = self._make_idle_batch()
+                    is_prefill = False
                 if seqs:
+                    dummy = (seqs[0].seq_id == -1)
                     token_ids = self.model_runner.call("run", seqs, is_prefill)
-                    with sched_lock:
-                        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-                    self.profiler.step()
-                    for seq in seqs:
-                        if seq.is_finished:
-                            result_queue.put([(seq.seq_id, seq.completion_token_ids)])
+                    if not dummy:
+                        with sched_lock:
+                            self.scheduler.postprocess(seqs, token_ids, is_prefill)
+                        self.profiler.step()
+                        for seq in seqs:
+                            if seq.is_finished:
+                                result_queue.put([(seq.seq_id, seq.completion_token_ids)])
                 else:
                     wake_event.wait(timeout=0.5)
 
@@ -172,16 +178,35 @@ class DPClient:
     def add_request(self, seq: Sequence):
         self.scheduler.add(seq)
 
+    def _make_idle_batch(self) -> list[Sequence]:
+        """Create a dummy batch to prevent NCCL deadlock when this DP group is idle.
+
+        In EP mode, all ranks must participate in the all-to-all communication
+        during MoE forward.  If one DP group has no requests, it sends a dummy
+        token whose result is discarded after the step.
+        """
+        seq = Sequence([0], seq_id=-1)
+        seq.num_scheduled_tokens = 1
+        seq.block_table = [0]       # reserved block 0
+        seq.status = SequenceStatus.RUNNING
+        return [seq]
+
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        if seqs:
-            token_ids = self.model_runner.call("run", seqs, is_prefill)
-            self.scheduler.postprocess(seqs, token_ids, is_prefill)
-            self.profiler.step()
-            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        else:
-            #[TODO] add IDLE sync
-            outputs = []
+        if not seqs and self.ep_enabled:
+            seqs = self._make_idle_batch()
+            is_prefill = False
+        if not seqs:
+            return []
+
+        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        # Dummy batch — discard output, skip postprocess
+        if seqs[0].seq_id == -1:
+            return []
+
+        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        self.profiler.step()
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs
 
     def exit(self):

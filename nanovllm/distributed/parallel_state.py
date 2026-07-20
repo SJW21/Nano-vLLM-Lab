@@ -106,21 +106,48 @@ class GroupCoordinator:
             output_tensor = None
         return output_tensor
 
-    def all_gather(self, input_:torch.Tensor, dim: int = -1) -> torch.Tensor:
-        raise NotImplementedError
-    
+    def all_to_all(self, input_: torch.Tensor,
+                   output_split_sizes: list[int] | None = None,
+                   input_split_sizes: list[int] | None = None) -> torch.Tensor:
+        world_size = self.world_size
+        if output_split_sizes is None:
+            output_split_sizes = [input_.size(0) // world_size] * world_size
+        if input_split_sizes is None:
+            input_split_sizes = [input_.size(0) // world_size] * world_size
+        output = torch.empty(sum(output_split_sizes), *input_.shape[1:],
+                             dtype=input_.dtype, device=input_.device)
+        dist.all_to_all_single(output, input_,
+                               output_split_sizes, input_split_sizes,
+                               group=self.device_group)
+        return output
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        world_size = self.world_size
+        if dim < 0:
+            dim += input_.dim()
+        gather_list = [torch.empty_like(input_) for _ in range(world_size)]
+        dist.all_gather(gather_list, input_, group=self.device_group)
+        return torch.cat(gather_list, dim=dim)
+
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        raise NotImplementedError
-    
+        world_size = self.world_size
+        if dim < 0:
+            dim += input_.dim()
+        input_list = list(input_.chunk(world_size, dim=dim))
+        output = torch.empty_like(input_list[0])
+        dist.reduce_scatter(output, input_list, group=self.device_group)
+        return output
+
     def send(self, tensor: torch.Tensor, dst: int| None = None) -> None:
         raise NotImplementedError
-    
+
     def recv(self, tensor: torch.Tensor, dtype: torch.dtype, src: int| None = None) -> None:
         raise NotImplementedError
     
 
 _TP: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
+_EP: GroupCoordinator | None = None
 _WORLD: GroupCoordinator | None = None
 
 def is_valid_ipv6_address(address: str) -> bool:
@@ -163,6 +190,7 @@ def initialize_model_parallel(
     world_size: int = 1,
     tensor_parallel_size: int = 1,
     data_parallel_size: int = 1,
+    expert_parallel_size: int = 1,
     backend: str | None = None
 ):
     """
@@ -170,10 +198,14 @@ def initialize_model_parallel(
     Arguments:
         tensor_parallel_size: number of GPUs used for tensor_parallel_size,
         data_parallel_size: number of GPUs for A Single DP Group,
+        expert_parallel_size: number of GPUs for expert parallelism (EP=全体rank).
     """
     assert torch.distributed.is_initialized()
     assert world_size == tensor_parallel_size * data_parallel_size, \
         "World Size must satisfy DP x TP now."
+    if expert_parallel_size > 1:
+        assert expert_parallel_size == world_size, \
+            "EP size must equal world_size (EP overlays all ranks)."
 
     all_ranks = torch.arange(world_size).reshape(
         data_parallel_size,
@@ -188,7 +220,7 @@ def initialize_model_parallel(
     assert _TP is None, "tensor model parallel group is already initialized"
     group_ranks = all_ranks.view(-1, tensor_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
-    _TP = GroupCoordinator(group_ranks=group_ranks, 
+    _TP = GroupCoordinator(group_ranks=group_ranks,
                            dist_backend=backend,
                            group_name="tp")
 
@@ -198,9 +230,18 @@ def initialize_model_parallel(
     if data_parallel_size > 1:
         group_ranks = all_ranks.transpose(1, 0).reshape(-1, data_parallel_size).unbind(0)
         group_ranks = [x.tolist() for x in group_ranks]
-        _DP = GroupCoordinator(group_ranks=group_ranks, 
+        _DP = GroupCoordinator(group_ranks=group_ranks,
                                dist_backend=backend,
                                group_name="dp")
+
+    # Build the expert model-parallel group.
+    global _EP
+    assert _EP is None, "expert parallel group is already initialized"
+    if expert_parallel_size > 1:
+        group_ranks = [list(range(world_size))]
+        _EP = GroupCoordinator(group_ranks=group_ranks,
+                               dist_backend=backend,
+                               group_name="ep")
 
 
 
@@ -219,11 +260,27 @@ def get_tp_group() -> GroupCoordinator:
     return _TP
 
 
+def get_ep_group() -> GroupCoordinator:
+    assert _EP is not None, "expert parallel group is not initialized"
+    return _EP
+
+
 def destroy_distributed_environment():
-    global _WORLD, _NODE_COUNT
+    global _WORLD, _TP, _DP, _EP
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
-    _NODE_COUNT = None
+    _TP = None
+    _DP = None
+    _EP = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+
+
+def reset_parallel_groups():
+    """Reset all parallel group globals (for testing)."""
+    global _TP, _DP, _EP, _WORLD
+    _TP = None
+    _DP = None
+    _EP = None
+    _WORLD = None

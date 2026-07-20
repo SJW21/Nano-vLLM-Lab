@@ -29,7 +29,8 @@ class BlockManager:
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
+        # Block 0 is reserved for IDLE dummy batch (EP deadlock prevention).
+        self.free_block_ids: deque[int] = deque(range(1, num_blocks))
         self.used_block_ids: set[int] = set()
 
     @classmethod
