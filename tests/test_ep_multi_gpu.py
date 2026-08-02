@@ -256,6 +256,7 @@ def test_moe_ep_forward():
         ep_size=EP_SIZE,
         ep_rank=ep_rank,
         moe_mode="ep",
+        comm_mode="all_to_all",
         norm_topk_prob=True,
     )
     moe.eval()
@@ -335,6 +336,7 @@ def test_moe_idle_rank():
         moe_intermediate_size=MOE_INTERMEDIATE,
         num_experts=NUM_EXPERTS, top_k=TOP_K,
         ep_size=EP_SIZE, ep_rank=ep_rank, moe_mode="ep",
+        comm_mode="all_to_all",
     )
     moe.eval()
     torch.set_default_device("cpu")
@@ -373,6 +375,7 @@ def test_moe_reproducibility():
         moe_intermediate_size=MOE_INTERMEDIATE,
         num_experts=NUM_EXPERTS, top_k=TOP_K,
         ep_size=EP_SIZE, ep_rank=rank, moe_mode="ep",
+        comm_mode="all_to_all",
     )
     moe.eval()
     torch.set_default_device("cpu")

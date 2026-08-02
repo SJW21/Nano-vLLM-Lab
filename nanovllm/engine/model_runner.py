@@ -30,10 +30,12 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        # EP mode requires eager execution (v0.2 limitation):
+        # EP mode + all_to_all communication requires eager execution:
         # dynamic all-to-all split sizes are incompatible with CUDA graphs.
+        # all_gather mode uses fixed-size buffers → CUDA Graph compatible.
         self.ep_enabled = config.expert_parallel_size > 1
-        if self.ep_enabled:
+        ep_blocks_graph = self.ep_enabled and config.ep_comm_mode == "all_to_all"
+        if ep_blocks_graph:
             config.enforce_eager = True
         self.enforce_eager = config.enforce_eager
         self.tp_size = config.tensor_parallel_size
@@ -57,7 +59,8 @@ class ModelRunner:
         if is_moe:
             ep_size = config.expert_parallel_size
             ep_rank = rank if ep_size > 1 else 0  # EP covers all ranks
-            self.model = Qwen3MoEForCausalLM(hf_config, ep_size, ep_rank, config.moe_mode)
+            self.model = Qwen3MoEForCausalLM(hf_config, ep_size, ep_rank,
+                                               config.moe_mode, config.ep_comm_mode)
             load_model(self.model, config.model,
                        ep_size=ep_size, ep_rank=ep_rank,
                        num_experts=hf_config.num_experts)

@@ -103,6 +103,7 @@ class Qwen3MoEDecoderLayer(nn.Module):
         ep_size: int = 1,
         ep_rank: int = 0,
         moe_mode: str = "ep",
+        comm_mode: str = "auto",
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3MoEAttention(
@@ -125,6 +126,7 @@ class Qwen3MoEDecoderLayer(nn.Module):
             ep_size=ep_size,
             ep_rank=ep_rank,
             moe_mode=moe_mode,
+            comm_mode=comm_mode,
             hidden_act=config.hidden_act,
             norm_topk_prob=getattr(config, "norm_topk_prob", True),
         )
@@ -155,11 +157,12 @@ class Qwen3MoEModel(nn.Module):
         ep_size: int = 1,
         ep_rank: int = 0,
         moe_mode: str = "ep",
+        comm_mode: str = "auto",
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
-            Qwen3MoEDecoderLayer(config, ep_size, ep_rank, moe_mode)
+            Qwen3MoEDecoderLayer(config, ep_size, ep_rank, moe_mode, comm_mode)
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -197,9 +200,10 @@ class Qwen3MoEForCausalLM(nn.Module):
         ep_size: int = 1,
         ep_rank: int = 0,
         moe_mode: str = "ep",
+        comm_mode: str = "auto",
     ) -> None:
         super().__init__()
-        self.model = Qwen3MoEModel(config, ep_size, ep_rank, moe_mode)
+        self.model = Qwen3MoEModel(config, ep_size, ep_rank, moe_mode, comm_mode)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
