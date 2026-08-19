@@ -326,38 +326,42 @@ class TestWeightLoaderRemap:
 
     def test_expert_owned_by_rank(self):
         from nanovllm.utils.loader import _remap_expert_weight
-        result = _remap_expert_weight(
+        name, eid = _remap_expert_weight(
             "model.layers.0.mlp.experts.42.gate_proj.weight",
             ep_size=8, ep_rank=2, num_experts=128,
         )
-        assert result == "model.layers.0.mlp.experts.10.gate_proj.weight", \
-            f"Expected local expert 10, got {result}"
+        # ep_size>1 → mapped to stacked_gate with local expert id 10
+        assert name == "model.layers.0.mlp.stacked_gate", \
+            f"Expected stacked_gate, got {name}"
+        assert eid == 10, f"Expected local expert 10, got {eid}"
 
     def test_expert_not_owned(self):
         from nanovllm.utils.loader import _remap_expert_weight
-        result = _remap_expert_weight(
+        name, eid = _remap_expert_weight(
             "model.layers.0.mlp.experts.42.gate_proj.weight",
             ep_size=8, ep_rank=0, num_experts=128,
         )
-        assert result is None, "Expert 42 should be skipped for ep_rank=0"
+        assert name is None, "Expert 42 should be skipped for ep_rank=0"
+        assert eid is None
 
     def test_non_expert_passes_through(self):
         from nanovllm.utils.loader import _remap_expert_weight
-        result = _remap_expert_weight(
+        name, eid = _remap_expert_weight(
             "model.layers.0.self_attn.q_proj.weight",
             ep_size=8, ep_rank=0, num_experts=128,
         )
-        assert result == "model.layers.0.self_attn.q_proj.weight"
+        assert name == "model.layers.0.self_attn.q_proj.weight"
+        assert eid is None
 
     def test_ep_size_1_loads_all(self):
         from nanovllm.utils.loader import _remap_expert_weight
         for eid in [0, 42, 127]:
-            result = _remap_expert_weight(
+            name, _ = _remap_expert_weight(
                 f"model.layers.0.mlp.experts.{eid}.gate_proj.weight",
                 ep_size=1, ep_rank=0, num_experts=128,
             )
-            assert result == f"model.layers.0.mlp.experts.{eid}.gate_proj.weight", \
-                f"ep_size=1 should load expert {eid} as-is"
+            assert name == f"model.layers.0.mlp.experts.{eid}.gate_proj.weight", \
+                f"ep_size=1 should load expert {eid} as-is, got {name}"
 
 
 # ---------------------------------------------------------------------------

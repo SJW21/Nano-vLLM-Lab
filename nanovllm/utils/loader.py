@@ -11,12 +11,14 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 
 def _remap_expert_weight(weight_name: str, ep_size: int, ep_rank: int,
-                         num_experts: int) -> str | None:
-    """Remap expert weight name for EP filtering.
+                         num_experts: int) -> tuple[str | None, int | None]:
+    """Remap expert weight name for EP filtering with stacked parameters.
 
-    In EP mode, each rank only loads a subset of experts. The HF checkpoint
-    names experts by their global ID (0..num_experts-1); this function maps
-    the global expert ID to the local expert ID for the current EP rank.
+    In EP mode, each rank only loads a subset of experts.  The HF checkpoint
+    names experts by global ID (0..num_experts-1).  This function maps the
+    global expert ID to the local expert ID and a stacked-parameter name
+    (``stacked_gate`` / ``stacked_up`` / ``stacked_down``) so the weight
+    loader can write directly into the correct slot of the batched tensor.
 
     Args:
         weight_name: HF weight name (e.g. "model.layers.0.mlp.experts.42.gate_proj.weight").
@@ -25,12 +27,13 @@ def _remap_expert_weight(weight_name: str, ep_size: int, ep_rank: int,
         num_experts: total number of experts in the model.
 
     Returns:
-        Remapped weight name if the expert belongs to this rank, None if it
-        should be skipped (belongs to another rank).
+        ``(param_name, expert_id)`` if the expert belongs to this rank,
+        ``(None, None)`` if it should be skipped (belongs to another rank).
+        For non-expert weights, returns ``(weight_name, None)`` as-is.
     """
     m = re.search(r"experts\.(\d+)\.", weight_name)
     if m is None:
-        return weight_name  # Not an expert weight, load as-is.
+        return weight_name, None  # Not an expert weight, load as-is.
 
     expert_id = int(m.group(1))
     experts_per_rank = num_experts // ep_size
@@ -38,9 +41,27 @@ def _remap_expert_weight(weight_name: str, ep_size: int, ep_rank: int,
     owner_rank = expert_id // experts_per_rank
 
     if owner_rank != ep_rank:
-        return None  # Skip: this expert belongs to another rank.
+        return None, None  # Skip: this expert belongs to another rank.
 
-    return weight_name.replace(f"experts.{expert_id}.", f"experts.{local_id}.")
+    if ep_size == 1:
+        # Keep individual expert names (no stacked params for ep_size=1).
+        return weight_name.replace(
+            f"experts.{expert_id}.", f"experts.{local_id}."), None
+
+    # Map to stacked parameter name:
+    #   experts.{global_id}.gate_proj.weight → stacked_gate
+    #   experts.{global_id}.up_proj.weight   → stacked_up
+    #   experts.{global_id}.down_proj.weight → stacked_down
+    if 'gate_proj' in weight_name:
+        new_name = re.sub(r'experts\.\d+\.gate_proj\.weight', 'stacked_gate', weight_name)
+    elif 'up_proj' in weight_name:
+        new_name = re.sub(r'experts\.\d+\.up_proj\.weight', 'stacked_up', weight_name)
+    elif 'down_proj' in weight_name:
+        new_name = re.sub(r'experts\.\d+\.down_proj\.weight', 'stacked_down', weight_name)
+    else:
+        return weight_name, None  # shouldn't happen for expert weights
+
+    return new_name, local_id
 
 
 def load_model(model: nn.Module, path: str,
@@ -63,9 +84,11 @@ def load_model(model: nn.Module, path: str,
                 # --- EP expert filtering ---
                 # hf_name: original key in the checkpoint (never mutated).
                 # param_name: target parameter name (may be remapped for EP).
+                # expert_id: local expert index for stacked params (or None).
                 param_name = hf_name
+                expert_id = None
                 if num_experts is not None and ep_size > 1:
-                    param_name = _remap_expert_weight(
+                    param_name, expert_id = _remap_expert_weight(
                         hf_name, ep_size, ep_rank, num_experts
                     )
                     if param_name is None:
@@ -83,4 +106,7 @@ def load_model(model: nn.Module, path: str,
                 else:
                     param = model.get_parameter(param_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, f.get_tensor(hf_name))
+                    if expert_id is not None:
+                        weight_loader(param, f.get_tensor(hf_name), expert_id)
+                    else:
+                        weight_loader(param, f.get_tensor(hf_name))

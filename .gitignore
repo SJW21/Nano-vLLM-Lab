@@ -195,3 +195,7 @@ cython_debug/
 .cursorindexingignore
 
 .opencode
+.claude
+
+# remove test file (not final test files)
+.tests/

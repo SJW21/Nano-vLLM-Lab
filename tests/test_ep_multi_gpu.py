@@ -89,12 +89,18 @@ def gather_expert_weights_to_rank0(moe: MoELayer, ep_size: int):
     rank = dist.get_rank()
     PER_EXP = 3 * MOE_INTERMEDIATE * HIDDEN  # gate + up + down params per expert
 
-    # Flatten all local expert weights into one 1D CPU tensor
+    # Flatten all local expert weights into one 1D CPU tensor.
+    # (EP>1 uses stacked_gate/up/down; ep_size=1 uses individual experts.)
     flat_parts = []
-    for exp in moe.experts:
-        flat_parts.append(exp.gate_proj.weight.data.cpu().flatten())
-        flat_parts.append(exp.up_proj.weight.data.cpu().flatten())
-        flat_parts.append(exp.down_proj.weight.data.cpu().flatten())
+    if hasattr(moe, 'stacked_gate'):
+        flat_parts.append(moe.stacked_gate.data.cpu().flatten())
+        flat_parts.append(moe.stacked_up.data.cpu().flatten())
+        flat_parts.append(moe.stacked_down.data.cpu().flatten())
+    else:
+        for exp in moe.experts:
+            flat_parts.append(exp.gate_proj.weight.data.cpu().flatten())
+            flat_parts.append(exp.up_proj.weight.data.cpu().flatten())
+            flat_parts.append(exp.down_proj.weight.data.cpu().flatten())
     local_flat = torch.cat(flat_parts)  # [EXPERTS_PER_RANK * PER_EXP]
 
     # All ranks have the same number of experts → equal-size tensors.

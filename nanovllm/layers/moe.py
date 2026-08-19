@@ -4,7 +4,31 @@ import torch.nn.functional as F
 
 from nanovllm.layers.linear import ReplicatedLinear
 from nanovllm.layers.activation import SiluAndMul
+from nanovllm.layers.moe_kernels import moe_ffn_pair, moe_align, BLOCK_M
 from nanovllm.distributed.parallel_state import get_ep_group
+
+# Module-level cache for alignment buffers (shared across all MoE layers
+# because all layers have the same D and N → identical T_MAX).
+_za2a_buf_cache: dict[tuple, dict[str, torch.Tensor]] = {}
+
+
+def _get_or_create_za2a_buffers(device, dtype, N, D, T_MAX, E_LOCAL=0):
+    """Get or create shared alignment buffers for the zero-A2A path.
+
+    All MoE layers share the same buffers because they have the same D
+    and N (hence identical T_MAX).  This cuts memory from O(L) to O(1).
+    """
+    key = (device.index if device.index is not None else device, N, D, T_MAX)
+    if key not in _za2a_buf_cache:
+        _za2a_buf_cache[key] = {
+            "x_align":  torch.empty(T_MAX, D, dtype=dtype, device=device),
+            "w_align":  torch.empty(T_MAX,    dtype=dtype, device=device),
+            "e_align":  torch.zeros(T_MAX,    dtype=torch.int64, device=device),
+            "cnt":      torch.zeros(max(E_LOCAL + 1, 1), dtype=torch.int32, device=device),
+            "out_align": torch.empty(T_MAX, D, dtype=dtype, device=device),
+            "partial":  torch.empty(N, D,     dtype=dtype, device=device),
+        }
+    return _za2a_buf_cache[key]
 
 
 class ExpertFFN(nn.Module):
@@ -39,12 +63,20 @@ class MoELayer(nn.Module):
     """Mixture-of-Experts layer supporting EP and TP parallel modes.
 
     EP mode (moe_mode="ep"):
-        Three communication backends are available via `comm_mode`:
+        Four communication backends are available via `comm_mode`:
 
         "auto" (default):
             Uses all_to_all for eager execution (bandwidth-optimal, zero compute
-            waste) and automatically switches to all_gather during CUDA Graph
-            capture (fixed-shape, graph-compatible via is_current_stream_capturing).
+            waste) and automatically switches to zero_a2a during CUDA Graph
+            capture (fixed-shape, graph-compatible, zero token dispatch).
+
+        "zero_a2a":
+            Zero all-to-all: no token dispatch at all.  Each rank keeps its
+            local tokens and computes partial expert outputs only for the
+            experts it owns, then an AllReduce sums the partials.
+            CUDA-Graph compatible (fixed-shape Triton kernel over padded
+            aligned buffers) and cheaper than all_gather (no duplicate compute).
+            Requires DP=1 (all ranks hold identical tokens).
 
         "all_gather":
             Always uses AllGather → slot-dispatch → ReduceScatter. CUDA-Graph
@@ -82,7 +114,7 @@ class MoELayer(nn.Module):
         super().__init__()
         assert hidden_act == "silu", "Only SiLU activation is supported for MoE experts."
         assert moe_mode in ("ep", "tp"), f"Invalid moe_mode: {moe_mode}"
-        assert comm_mode in ("all_gather", "all_to_all", "auto"), \
+        assert comm_mode in ("all_gather", "all_to_all", "auto", "zero_a2a"), \
             f"Invalid comm_mode: {comm_mode}"
         assert num_experts % ep_size == 0, \
             f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})"
@@ -102,11 +134,41 @@ class MoELayer(nn.Module):
         # Named "gate" to match HF checkpoint key: model.layers.X.mlp.gate.weight
         self.gate = ReplicatedLinear(hidden_size, num_experts, bias=False)
 
-        # Local experts: subset of all experts assigned to this rank
-        self.experts = nn.ModuleList([
-            ExpertFFN(hidden_size, moe_intermediate_size)
-            for _ in range(self.experts_per_rank)
-        ])
+        # Expert weights: when EP > 1, store as stacked [E, D, M] tensors
+        # directly (ready for bmm, no runtime copies).  For ep_size == 1
+        # (128 experts → would be ~3.6 GB/layer), keep individual ExpertFFN
+        # modules and stack only active experts on-the-fly in _compute_local.
+        if ep_size > 1:
+            # --- Stacked parameters (EP mode, ~32 experts/rank) ---
+            # Shape follows nn.Linear convention [out_features, in_features]:
+            #   gate/up: [moe_intermediate, hidden]   = [M, D]
+            #   down:    [hidden, moe_intermediate]    = [D, M]
+            # bmm uses .transpose(1,2) to get [E, D, M] — a view, zero copy.
+            E = self.experts_per_rank
+            self.stacked_gate = nn.Parameter(
+                torch.empty(E, moe_intermediate_size, hidden_size))
+            self.stacked_up = nn.Parameter(
+                torch.empty(E, moe_intermediate_size, hidden_size))
+            self.stacked_down = nn.Parameter(
+                torch.empty(E, hidden_size, moe_intermediate_size))
+
+            # Custom weight-loaders: write directly into expert slot.
+            def _make_loader():
+                def loader(param, loaded_weight, expert_id=0):
+                    param.data[expert_id].copy_(loaded_weight)
+                return loader
+            self.stacked_gate.weight_loader = _make_loader()
+            self.stacked_up.weight_loader   = _make_loader()
+            self.stacked_down.weight_loader = _make_loader()
+
+            # Keep an empty experts list for API compatibility with tests.
+            self.experts = nn.ModuleList()
+        else:
+            # --- Individual experts (ep_size=1, 128 experts/rank) ---
+            self.experts = nn.ModuleList([
+                ExpertFFN(hidden_size, moe_intermediate_size)
+                for _ in range(self.experts_per_rank)
+            ])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass for MoE layer.
@@ -129,11 +191,13 @@ class MoELayer(nn.Module):
                 return self._forward_ep_ag(hidden_states, weights, indices)
             elif self.comm_mode == "all_to_all":
                 return self._forward_ep_ata(hidden_states, weights, indices)
+            elif self.comm_mode == "zero_a2a":
+                return self._forward_ep_za2a(hidden_states, weights, indices)
             else:  # "auto"
-                # During CUDA Graph capture, use the graph-compatible all_gather
+                # During CUDA Graph capture, use the graph-compatible zero_a2a
                 # path; otherwise use the bandwidth-optimal all_to_all path.
                 if torch.cuda.is_current_stream_capturing():
-                    return self._forward_ep_ag(hidden_states, weights, indices)
+                    return self._forward_ep_za2a(hidden_states, weights, indices)
                 else:
                     return self._forward_ep_ata(hidden_states, weights, indices)
         else:
@@ -295,7 +359,7 @@ class MoELayer(nn.Module):
 
         N_flat = N_all * K
 
-        # --- Phase 3: fixed-capacity per-expert slot dispatch ---
+        # --- Phase 3: capacity calculation ---
         # Capacity: allocate enough slots per expert so overflow probability
         # is negligible.  Expected tokens per expert = N_flat / num_experts.
         # With capacity = 3× expected, Chernoff bound gives P(overflow) < 10⁻⁷⁴
@@ -304,41 +368,43 @@ class MoELayer(nn.Module):
         capacity = min(expected * 3, N_flat)   # never exceed total tokens
         capacity = max(capacity, 64)            # floor at 64 slots
 
+        # --- Phase 3b: per-expert dispatch + compute ---
+        # Per-expert matmul (not bmm): use [capacity, D] temporary per expert,
+        # re-used across the loop.  Memory = capacity × D ≈ 1.5 MB vs bmm's
+        # [E, capacity, D] ≈ 48 MB.  CUDA Graph eliminates per-iteration kernel
+        # launch overhead, so bmm's fusion benefit is marginal here.
         output = torch.zeros(N_all, D, dtype=hidden_states.dtype,
                              device=hidden_states.device)
+        E = self.experts_per_rank
+        expert_buffer = torch.zeros(capacity, D,
+                                    dtype=hidden_states.dtype,
+                                    device=hidden_states.device)
 
-        for e in range(self.experts_per_rank):              # fixed iteration count
-            # Boolean mask: which flat positions route to local expert e
-            mask = is_local_flat & (local_exp_flat == e)    # [N_flat]
+        for e in range(E):                                   # fixed iteration count
+            mask = is_local_flat & (local_exp_flat == e)     # [N_flat]
+            slot_idx = torch.cumsum(mask.int(), dim=0) - 1   # [N_flat]
+            safe_idx = slot_idx.clamp(0, capacity - 1)       # [N_flat]
+            mask_float = mask.to(hidden_flat.dtype).unsqueeze(-1)
 
-            # Consecutive slot IDs: cumsum assigns 0,1,2,… for True positions,
-            # -1 for False positions.  Entirely graph-capturable (fixed shape).
-            slot_idx = torch.cumsum(mask.int(), dim=0) - 1  # [N_flat]
-            safe_idx = slot_idx.clamp(0, capacity - 1)      # [N_flat], safe for indexing
-
-            # Scatter tokens into fixed-size expert buffer via index_add_.
-            # Positions where mask==False contribute zero → no effect on slot 0.
-            mask_float = mask.to(hidden_flat.dtype).unsqueeze(-1)   # [N_flat, 1]
-            expert_buffer = torch.zeros(capacity, D, dtype=hidden_states.dtype,
-                                        device=hidden_states.device)
+            # Fill per-expert buffer
+            expert_buffer.zero_()
             expert_buffer.index_add_(0, safe_idx, hidden_flat * mask_float)
 
-            # --- Phase 4: fixed-size expert FFN (graph-capturable) ---
-            expert_out = self.experts[e](expert_buffer)      # [capacity, D]
+            # Per-expert FFN (uses stacked weight for fast lookup)
+            gate = torch.mm(expert_buffer, self.stacked_gate[e].t())
+            up   = torch.mm(expert_buffer, self.stacked_up[e].t())
+            out_e = torch.mm(F.silu(gate) * up, self.stacked_down[e].t())
+            # out_e: [capacity, D]
 
-            # Gather results: expert_out[safe_idx] reads each position's slot.
-            # Mask zeros out invalid positions (which all happen to index slot 0).
-            gathered = expert_out[safe_idx] * mask_float     # [N_flat, D]
-
-            # Apply routing weights
-            w = weights_flat.unsqueeze(-1) * mask_float      # [N_flat, 1]
+            # Gather results
+            gathered = out_e[safe_idx] * mask_float          # [N_flat, D]
+            w = weights_flat.unsqueeze(-1) * mask_float       # [N_flat, 1]
             gathered = gathered * w
 
-            # Reshape [N_flat, D] → [N_all, K, D] and sum over K experts
             gathered_3d = gathered.reshape(N_all, K, D)
-            output += gathered_3d.sum(dim=1)                 # [N_all, D]
+            output += gathered_3d.sum(dim=1)                  # [N_all, D]
 
-        # --- Phase 5: ReduceScatter ---
+        # --- Phase 4: ReduceScatter ---
         return ep_group.reduce_scatter(output, dim=0)         # [N, D]
 
     # ------------------------------------------------------------------
@@ -391,6 +457,205 @@ class MoELayer(nn.Module):
         return output
 
     # ------------------------------------------------------------------
+    # EP mode (zero_a2a): local compute + all_reduce combine
+    #
+    # Under DP=1 (all ranks hold identical tokens) there is no need to
+    # dispatch tokens at all.  Each rank computes partial expert outputs
+    # only for the experts it owns, writing zeros for non-local (t,k)
+    # pairs.  A single AllReduce then sums the partials across EP ranks.
+    #
+    # Tokens are aligned into fixed-capacity expert blocks (CAP per
+    # expert + 1 null block) so every tensor shape depends only on the
+    # (fixed) batch size N → fully CUDA-Graph capturable.
+    #
+    # Buffers are shared across all MoE layers via a module-level cache
+    # (_get_or_create_za2a_buffers) — all layers have identical D and
+    # N, so alignment shapes are identical.
+    # ------------------------------------------------------------------
+
+    def _forward_ep_za2a(
+        self,
+        hidden_states: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Zero-A2A EP forward — CUDA-Graph capturable, no token dispatch.
+
+        Flow:
+          1. Expand hidden_states to [N*K, D] and map each (token, topk)
+             pair to its local expert id (or -1 for non-local).
+          2. Scatter pairs into fixed-capacity per-expert blocks (one block
+             per local expert + one null block for non-local tokens).
+             Every tensor shape depends only on N → graph-safe.
+          3. Single fused Triton kernel (gate/up → SiLU → down → route
+             weight multiply) over the aligned buffer.
+          4. Inverse-gather results back to original (t,k) order, merge
+             across top-k, and AllReduce partials across EP ranks.
+        """
+        N, D = hidden_states.shape
+        K = self.top_k
+
+        if self.ep_size == 1:
+            return self._forward_ep_local(hidden_states, weights, indices)
+        if N == 0:
+            return hidden_states
+
+        # ---- threshold: small batch → bmm path (CAP=N, zero overflow) ----
+        # torch.topk returns K *distinct* experts per token, so per-expert
+        # load is bounded by N.  CAP = N guarantees no capacity drop.
+        # For larger batches the Triton alignment path has better padding
+        # efficiency (BLOCK_M-aligned CAP vs 4× padding of bmm path).
+        if N * K <= 512:   # N ≤ 64 for K=8
+            return self._forward_ep_za2a_bmm(hidden_states, weights, indices)
+
+        E_local = self.experts_per_rank
+        NK = N * K
+        ep_group = get_ep_group()
+
+        # ---- capacity: fixed-size blocks, graph-safe ----
+        # Expected tokens per (global) expert = NK / num_experts.
+        # CAP = ceil(3 × expected / BLOCK_M) × BLOCK_M, floor BLOCK_M.
+        # Overflow probability is negligible per Chernoff bound (same
+        # argument as the all_gather path).
+        expected = (3 * NK + self.num_experts - 1) // self.num_experts
+        CAP = max(((expected + BLOCK_M - 1) // BLOCK_M) * BLOCK_M, BLOCK_M)
+        T_MAX = (E_local + 1) * CAP
+
+        # Reuse buffers across layers: use module-level cache keyed by
+        # (D, T_MAX) so all 48 MoE layers share the same alignment buffers.
+        bufs = _get_or_create_za2a_buffers(hidden_states.device,
+                                           hidden_states.dtype, N, D, T_MAX, E_local)
+
+        # ---- 1. expand + route mapping (all fixed-shape) ----
+        x_flat = hidden_states.unsqueeze(1).expand(-1, K, -1).reshape(NK, D)
+        e_global = indices.reshape(NK)
+        is_local_bool = (e_global // E_local) == self.ep_rank      # [NK] bool
+        is_local = is_local_bool.to(torch.int32)                     # [NK] int32 for Triton
+        local_exp = torch.where(is_local_bool, e_global % E_local, -1)  # [NK] int64
+        w_flat = weights.reshape(NK)
+
+        # ---- 2. alignment: 1 Triton kernel replaces ~100 scatter launches ----
+        # Pre-zero the align buffers (padding rows remain zero → FFN kernel
+        # computes on zero data, producing zero output for empty slots).
+        bufs["x_align"].zero_()
+        bufs["w_align"].zero_()
+        bufs["cnt"].zero_()
+
+        pos_flat, keep = moe_align(
+            x_flat, w_flat, is_local, local_exp,
+            bufs["x_align"], bufs["w_align"], bufs["cnt"],
+            E_local, CAP,
+        )
+
+        # Fill e_align sentinels (once per buffer at creation time).
+        # Null block = 0, expert e block = e+1.
+        if not bufs.get("_e_init"):
+            for e in range(E_local):
+                bufs["e_align"][e * CAP:(e + 1) * CAP] = e + 1
+            bufs["_e_init"] = True
+
+        # ---- 3. fused Triton kernel (single launch) ----
+        moe_ffn_pair(
+            bufs["x_align"], self.stacked_gate, self.stacked_up, self.stacked_down,
+            bufs["w_align"], bufs["e_align"], bufs["out_align"],
+            M=self.moe_intermediate_size, D=D,
+        )
+
+        # ---- 4. inverse-gather + merge ----
+        # pos_flat is the absolute row index (computed by the align kernel).
+        # keep=0 for non-local and overflow pairs → zero contribution.
+        keep_flat = keep.to(hidden_states.dtype)                     # [NK] bf16 (0. or 1.)
+        out_flat = bufs["out_align"][pos_flat] * keep_flat.unsqueeze(-1)   # [NK, D]
+
+        bufs["partial"].zero_()
+        bufs["partial"].copy_(out_flat.reshape(N, K, D).sum(dim=1))   # [N, D]
+
+        # ---- 5. zero-a2a combine: AllReduce partials across EP ranks ----
+        ep_group.all_reduce(bufs["partial"])         # in-place
+        return bufs["partial"]
+
+    def _forward_ep_za2a_bmm(
+        self,
+        hidden_states: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Zero-A2A decode-optimised path: torch.bmm instead of Triton kernel.
+
+        Uses CAP = N (provably zero overflow — topk returns K distinct
+        experts per token) and batched matmul across all local experts:
+
+            x3d [E_local, CAP, D] @ W^T → gate/up [E_local, CAP, M]
+            silu(gate)*up @ W_down → out [E_local, CAP, D]
+
+        This eliminates the 95% padding waste of the BLOCK_M-aligned path
+        for small N and leverages cuBLAS tensor cores.
+        """
+        N, D = hidden_states.shape
+        K = self.top_k
+        if self.ep_size == 1:
+            return self._forward_ep_local(hidden_states, weights, indices)
+        if N == 0:
+            return hidden_states
+
+        E_local = self.experts_per_rank
+        NK = N * K
+        ep_group = get_ep_group()
+
+        # CAP = N: per-expert load ≤ N (each token contributes at most 1
+        # pair to any expert because topk picks K *distinct* experts).
+        CAP = N
+        T_MAX = (E_local + 1) * CAP
+
+        bufs = _get_or_create_za2a_buffers(hidden_states.device,
+                                           hidden_states.dtype, N, D, T_MAX, E_local)
+
+        # ---- 1. expand + route mapping ----
+        x_flat = hidden_states.unsqueeze(1).expand(-1, K, -1).reshape(NK, D)
+        e_global = indices.reshape(NK)
+        is_local_bool = (e_global // E_local) == self.ep_rank      # [NK] bool
+        is_local = is_local_bool.to(torch.int32)                     # [NK] int32 for Triton
+        local_exp = torch.where(is_local_bool, e_global % E_local, -1)  # [NK] int64
+        w_flat = weights.reshape(NK)
+
+        # ---- 2. alignment: 1 Triton kernel replaces scatter loop ----
+        # Note: w_align is written by moe_align but unused by bmm — harmless dead write.
+        bufs["x_align"].zero_()
+        bufs["cnt"].zero_()
+
+        pos_flat, keep = moe_align(
+            x_flat, w_flat, is_local, local_exp,
+            bufs["x_align"], bufs["w_align"], bufs["cnt"],
+            E_local, CAP,
+        )
+
+        # ---- 3. bmm FFN (replaces Triton kernel) ----
+        # x3d: [E_local, CAP, D] — view of x_align, expert blocks 1..E_local
+        x3d = bufs["x_align"].view(E_local + 1, CAP, D)[1:]        # [E, C, D]
+
+        gate = torch.bmm(x3d, self.stacked_gate.transpose(1, 2))    # [E, C, M]
+        up   = torch.bmm(x3d, self.stacked_up.transpose(1, 2))      # [E, C, M]
+        y    = F.silu(gate) * up                                      # [E, C, M] bf16
+        out3d = torch.bmm(y, self.stacked_down.transpose(1, 2))      # [E, C, D]
+
+        # out3d_view writes into the [1:] slice of out_align
+        out3d_view = bufs["out_align"].view(E_local + 1, CAP, D)[1:]
+        out3d_view.copy_(out3d)
+
+        # ---- 4. inverse-gather + merge (route weights applied here) ----
+        # pos_flat is the absolute row index (computed by the align kernel).
+        # keep=0 for non-local and overflow pairs → zero contribution.
+        keep_flat = keep.to(hidden_states.dtype)
+        out_flat = bufs["out_align"][pos_flat] * (w_flat * keep_flat).unsqueeze(-1)
+
+        bufs["partial"].zero_()
+        bufs["partial"].copy_(out_flat.reshape(N, K, D).sum(dim=1))
+
+        # ---- 5. all-reduce combine ----
+        ep_group.all_reduce(bufs["partial"])
+        return bufs["partial"]
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -416,7 +681,11 @@ class MoELayer(nn.Module):
         tokens: torch.Tensor,
         expert_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute expert FFN on dispatched tokens, grouped by expert.
+        """Per-expert FFN compute — memory-efficient, no padding.
+
+        Groups tokens by expert then iterates over active experts with
+        individual matmuls.  Uses stacked weights (EP>1) for fast lookup;
+        CUDA Graph eliminates per-expert launch overhead during decode.
 
         Args:
             tokens: [total_tokens, hidden_size] dispatched tokens.
@@ -425,28 +694,43 @@ class MoELayer(nn.Module):
         Returns:
             [total_tokens, hidden_size] expert outputs in original order.
         """
-        if tokens.size(0) == 0:
+        total_tokens = tokens.size(0)
+        if total_tokens == 0:
             return tokens
 
-        total_tokens = tokens.size(0)
-        dtype = tokens.dtype
+        D = self.hidden_size
 
-        # Group tokens by local expert
+        # --- Group tokens by local expert ---
         sort_idx = torch.argsort(expert_ids)
         tokens_sorted = tokens[sort_idx]
         ids_sorted = expert_ids[sort_idx]
 
-        unique_experts, counts = torch.unique_consecutive(ids_sorted, return_counts=True)
+        unique_exp, counts = torch.unique_consecutive(ids_sorted, return_counts=True)
 
-        output = torch.zeros(total_tokens, self.hidden_size, dtype=dtype, device=tokens.device)
-        ptr = 0
-        for exp_id, count in zip(unique_experts.tolist(), counts.tolist()):
-            output[ptr:ptr + count] = self.experts[exp_id](tokens_sorted[ptr:ptr + count])
-            ptr += count
+        output_sorted = tokens_sorted.new_empty(total_tokens, D)
 
-        # Restore original order
+        if self.ep_size > 1:
+            # EP mode: use stacked [E, out, in] parameters.
+            ptr = 0
+            for e, count in zip(unique_exp.tolist(), counts.tolist()):
+                x = tokens_sorted[ptr:ptr + count]                # [cnt, D]
+                gate = torch.mm(x, self.stacked_gate[e].t())      # [cnt, M]
+                up   = torch.mm(x, self.stacked_up[e].t())        # [cnt, M]
+                out  = torch.mm(F.silu(gate) * up,
+                                self.stacked_down[e].t())         # [cnt, D]
+                output_sorted[ptr:ptr + count] = out
+                ptr += count
+        else:
+            # ep_size=1: use individual ExpertFFN modules.
+            ptr = 0
+            for e, count in zip(unique_exp.tolist(), counts.tolist()):
+                x = tokens_sorted[ptr:ptr + count]
+                output_sorted[ptr:ptr + count] = self.experts[e](x)
+                ptr += count
+
+        # --- Restore original order ---
         unsort_idx = torch.argsort(sort_idx)
-        return output[unsort_idx]
+        return output_sorted[unsort_idx]
 
     def _compute_all_experts_tp(
         self,

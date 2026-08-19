@@ -50,11 +50,10 @@ def main():
     moe = MoELayer(HIDDEN, HIDDEN, MOE_INTERMEDIATE, NUM_EXPERTS, TOP_K,
                    ep_size=EP_SIZE, ep_rank=rank, comm_mode="all_gather")
 
-    # Init weights for reproducibility
-    for expert in moe.experts:
-        init.kaiming_uniform_(expert.gate_proj.weight)
-        init.kaiming_uniform_(expert.up_proj.weight)
-        init.kaiming_uniform_(expert.down_proj.weight)
+    # Init weights for reproducibility (stacked params)
+    init.kaiming_uniform_(moe.stacked_gate)
+    init.kaiming_uniform_(moe.stacked_up)
+    init.kaiming_uniform_(moe.stacked_down)
 
     # Init gate (ReplicatedLinear base weight)
     if hasattr(moe.gate, 'weight'):
