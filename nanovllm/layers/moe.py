@@ -1,34 +1,69 @@
 import torch
+import torch.distributed as dist
 from torch import nn
 import torch.nn.functional as F
 
 from nanovllm.layers.linear import ReplicatedLinear
 from nanovllm.layers.activation import SiluAndMul
-from nanovllm.layers.moe_kernels import moe_ffn_pair, moe_align, BLOCK_M
-from nanovllm.distributed.parallel_state import get_ep_group
+from nanovllm.layers.moe_kernels import BLOCK_M, moe_align, moe_ffn_pair
+from nanovllm.distributed.parallel_state import get_ep_group, get_tp_group, get_dp_group
 
 # Module-level cache for alignment buffers (shared across all MoE layers
 # because all layers have the same D and N → identical T_MAX).
-_za2a_buf_cache: dict[tuple, dict[str, torch.Tensor]] = {}
+_moe_buf_cache: dict[tuple, dict[str, torch.Tensor]] = {}
 
 
-def _get_or_create_za2a_buffers(device, dtype, N, D, T_MAX, E_LOCAL=0):
-    """Get or create shared alignment buffers for the zero-A2A path.
+def _cap_from_expected(expected, bound):
+    """CAP 计算：3σ Chernoff 期望值对齐 BLOCK_M，夹紧到 bound 对齐值。
 
-    All MoE layers share the same buffers because they have the same D
-    and N (hence identical T_MAX).  This cuts memory from O(L) to O(1).
+    moe_ffn_pair 要求 chunk 不跨块（CAP % BLOCK_M == 0）且 T_ALIGN 为 BLOCK_M
+    倍数，故下取整到 BLOCK_M；NK 本身是可行上界（每个 pair 至多占一行）。
     """
-    key = (device.index if device.index is not None else device, N, D, T_MAX)
-    if key not in _za2a_buf_cache:
-        _za2a_buf_cache[key] = {
-            "x_align":  torch.empty(T_MAX, D, dtype=dtype, device=device),
-            "w_align":  torch.empty(T_MAX,    dtype=dtype, device=device),
-            "e_align":  torch.zeros(T_MAX,    dtype=torch.int64, device=device),
-            "cnt":      torch.zeros(max(E_LOCAL + 1, 1), dtype=torch.int32, device=device),
+    cap = max(((expected + BLOCK_M - 1) // BLOCK_M) * BLOCK_M, BLOCK_M)
+    bound_aligned = max(((bound + BLOCK_M - 1) // BLOCK_M) * BLOCK_M, BLOCK_M)
+    return min(cap, bound_aligned)
+
+
+def get_or_create_moe_buffers(mode: str, device, dtype, N, D, T_MAX, num_blocks, CAP):
+    """跨层共享的 MoE 对齐/通信 buffer（各层 D、T_MAX 相同 → O(1) 份）。
+
+    mode: "fixbuf"（moe_ep decode 固定容量 a2a）或 "moe_tp"（129 块布局）。
+    cache key 含 mode，两种模式互不别名。block_id=0 保留为 null 块，共
+    num_blocks 个有效块 → cnt 长度 num_blocks+1，T_MAX = (num_blocks+1)*CAP。
+    fixbuf 模式额外提供 dispatch 用 send/recv buffer（§5.1），含随行传送
+    路由权重的 w 通道 send_w_buf/recv_w_buf。
+    e_align 在创建时填充哨兵（moe_ffn_pair 读 e_max-1 定位专家权重），fixbuf
+    compute 与 moe_tp 共用统一约定：哨兵 = block 号（1..num_blocks），block 0
+    保持 0（null 块）；专家 e 在 block e+1 → 哨兵 e+1 → kernel e0 = e。
+    （e_align 仅 compute/moe_tp 条目消费；send_e_buf 每轮 scatter，不走 e_align。）
+    """
+    key = (mode, device.index if device.index is not None else device, dtype, N, D, T_MAX, num_blocks, CAP)
+    if key not in _moe_buf_cache:
+        bufs = {
+            "x_align":   torch.empty(T_MAX, D, dtype=dtype, device=device),
+            "w_align":   torch.empty(T_MAX,    dtype=dtype, device=device),
+            "e_align":   torch.zeros(T_MAX,    dtype=torch.int64, device=device),
+            "cnt":       torch.zeros(num_blocks + 1, dtype=torch.int32, device=device),
             "out_align": torch.empty(T_MAX, D, dtype=dtype, device=device),
-            "partial":  torch.empty(N, D,     dtype=dtype, device=device),
+            "partial":   torch.empty(N, D,     dtype=dtype, device=device),
         }
-    return _za2a_buf_cache[key]
+        if mode == "fixbuf":
+            # dispatch 阶段：send_buf [(EP+1)*CAP, D]；a2a ×3（token + expert_id + w 通道）
+            bufs.update(
+                send_buf=torch.empty(T_MAX, D, dtype=dtype, device=device),
+                send_e_buf=torch.zeros(T_MAX, dtype=torch.int64, device=device),
+                send_w_buf=torch.empty(T_MAX, dtype=dtype, device=device),
+                recv_buf=torch.empty(T_MAX, D, dtype=dtype, device=device),
+                recv_e_buf=torch.zeros(T_MAX, dtype=torch.int64, device=device),
+                recv_w_buf=torch.empty(T_MAX, dtype=dtype, device=device),
+            )
+        # e_align 哨兵（创建时一次填充，之后每轮不重置）：哨兵 = block 号（1..num_blocks），
+        # block 0 保持 0 = null 块。moe_ffn_pair 读 e_max-1 定位专家权重：专家 e 在 block e+1
+        # → 哨兵 e+1 → e0 = e。fixbuf compute 与 moe_tp 共用同一约定。
+        for b in range(1, num_blocks + 1):
+            bufs["e_align"][b * CAP:(b + 1) * CAP] = b
+        _moe_buf_cache[key] = bufs
+    return _moe_buf_cache[key]
 
 
 class ExpertFFN(nn.Module):
@@ -60,38 +95,21 @@ class ExpertFFN(nn.Module):
 
 
 class MoELayer(nn.Module):
-    """Mixture-of-Experts layer supporting EP and TP parallel modes.
+    """Mixture-of-Experts layer supporting two parallel modes.
 
-    EP mode (moe_mode="ep"):
-        Four communication backends are available via `comm_mode`:
-
-        "auto" (default):
-            Uses all_to_all for eager execution (bandwidth-optimal, zero compute
-            waste) and automatically switches to zero_a2a during CUDA Graph
-            capture (fixed-shape, graph-compatible, zero token dispatch).
-
-        "zero_a2a":
-            Zero all-to-all: no token dispatch at all.  Each rank keeps its
-            local tokens and computes partial expert outputs only for the
-            experts it owns, then an AllReduce sums the partials.
-            CUDA-Graph compatible (fixed-shape Triton kernel over padded
-            aligned buffers) and cheaper than all_gather (no duplicate compute).
-            Requires DP=1 (all ranks hold identical tokens).
-
-        "all_gather":
-            Always uses AllGather → slot-dispatch → ReduceScatter. CUDA-Graph
-            compatible, but has compute waste from fixed-capacity buffers when
-            running eagerly.
-
-        "all_to_all":
-            Always uses two-phase all-to-all with metadata exchange. Most
-            bandwidth-efficient for eager mode, but dynamic split sizes
-            preclude CUDA Graph capture.
+    EP mode (moe_mode="ep", default):
+        All2All backend.  Experts are sharded by expert ID: each rank owns
+        E/EP complete experts, and tokens are dispatched to their target
+        experts via all-to-all.  Internally, decode uses the fixbuf
+        fixed-capacity a2a path (_forward_ep_a2a_fixbuf) and prefill uses
+        the dynamic a2a path (_forward_ep_a2a_eager); the routing threshold
+        is N_local × K ≤ 2048 / TP (§2.2).
 
     TP mode (moe_mode="tp"):
-        Each rank owns all experts but with TP-sharded weights. Hidden states
-        are all-gathered across ranks, each rank computes its shard, then
-        results are reduce-scattered back.
+        AllReduce backend.  Expert weights are sharded along the Hidden/M
+        dimension; each rank computes a partial result for all tokens,
+        combined via AllReduce over the full EP group
+        (_forward_tp, §2.1).
 
     The router (gate) is always fully replicated (no sharding) since it is
     small: hidden_size × num_experts ≈ 2048 × 128 ≈ 262K parameters.
@@ -107,15 +125,12 @@ class MoELayer(nn.Module):
         ep_size: int,
         ep_rank: int,
         moe_mode: str = "ep",
-        comm_mode: str = "auto",
         hidden_act: str = "silu",
         norm_topk_prob: bool = True,
     ):
         super().__init__()
         assert hidden_act == "silu", "Only SiLU activation is supported for MoE experts."
         assert moe_mode in ("ep", "tp"), f"Invalid moe_mode: {moe_mode}"
-        assert comm_mode in ("all_gather", "all_to_all", "auto", "zero_a2a"), \
-            f"Invalid comm_mode: {comm_mode}"
         assert num_experts % ep_size == 0, \
             f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})"
 
@@ -126,19 +141,47 @@ class MoELayer(nn.Module):
         self.ep_size = ep_size
         self.ep_rank = ep_rank
         self.moe_mode = moe_mode
-        self.comm_mode = comm_mode
         self.norm_topk_prob = norm_topk_prob
         self.experts_per_rank = num_experts // ep_size
+        # EP group = 全体 rank → dp_size = ep_size // tp_size（§2.1/§2.2）
+        self.tp_size = get_tp_group().world_size
 
         # Router (gate): fully replicated, small weight footprint
         # Named "gate" to match HF checkpoint key: model.layers.X.mlp.gate.weight
         self.gate = ReplicatedLinear(hidden_size, num_experts, bias=False)
 
-        # Expert weights: when EP > 1, store as stacked [E, D, M] tensors
-        # directly (ready for bmm, no runtime copies).  For ep_size == 1
-        # (128 experts → would be ~3.6 GB/layer), keep individual ExpertFFN
-        # modules and stack only active experts on-the-fly in _compute_local.
-        if ep_size > 1:
+        # Expert weights: when EP > 1, store as stacked tensors directly
+        # (ready for bmm, no runtime copies).  For ep_size == 1 (128 experts
+        # → would be ~3.6 GB/layer), keep individual ExpertFFN modules and
+        # stack only active experts on-the-fly in _compute_local.
+        if moe_mode == "tp" and ep_size > 1:
+            # --- Stacked parameters (TP mode: ALL experts × M/EP slice, §1) ---
+            # gate/up: [E, M/EP, D]；down: [E, D, M/EP]，E = num_experts（全专家本地持有）
+            assert moe_intermediate_size % ep_size == 0, \
+                f"moe_intermediate_size ({moe_intermediate_size}) 必须能被 ep_size ({ep_size}) 整除（R8）"
+            M_EP = moe_intermediate_size // ep_size
+            self.stacked_gate_tp = nn.Parameter(torch.empty(num_experts, M_EP, hidden_size))
+            self.stacked_up_tp = nn.Parameter(torch.empty(num_experts, M_EP, hidden_size))
+            self.stacked_down_tp = nn.Parameter(torch.empty(num_experts, hidden_size, M_EP))
+            # M 维 narrow loader：份数 = EP，切片索引 = rank 在 EP group 内位置（EP group = 全体 rank → ep_rank）。
+            # HF loaded_weight 布局：gate/up = [M, D]（M 在 dim0）；down = [D, M]（M 在 dim1）。
+            # 切片后形状与 param slot 对齐：gate/up [M_EP, D] ← [M_EP, D]；down [D, M_EP] ← [D, M_EP]。
+            m_slice = self.ep_rank * M_EP
+            def _make_tp_loader_m_dim0():      # gate/up：loaded [M, D] 的 M 维 = dim0
+                def loader(param, loaded_weight, expert_id=0):
+                    w = loaded_weight.narrow(0, m_slice, M_EP)
+                    param.data[expert_id].copy_(w)
+                return loader
+            def _make_tp_loader_m_dim1():      # down：loaded [D, M] 的 M 维 = dim1
+                def loader(param, loaded_weight, expert_id=0):
+                    w = loaded_weight.narrow(1, m_slice, M_EP)
+                    param.data[expert_id].copy_(w)
+                return loader
+            self.stacked_gate_tp.weight_loader = _make_tp_loader_m_dim0()
+            self.stacked_up_tp.weight_loader   = _make_tp_loader_m_dim0()
+            self.stacked_down_tp.weight_loader = _make_tp_loader_m_dim1()
+            self.experts = nn.ModuleList()      # API 兼容
+        elif ep_size > 1:
             # --- Stacked parameters (EP mode, ~32 experts/rank) ---
             # Shape follows nn.Linear convention [out_features, in_features]:
             #   gate/up: [moe_intermediate, hidden]   = [M, D]
@@ -170,6 +213,10 @@ class MoELayer(nn.Module):
                 for _ in range(self.experts_per_rank)
             ])
 
+        # moe_ep 且 TP>1 时为 True，供 decoder layer 决定 o_proj 的 RS 输出与
+        # residual 位置（§5.1）。
+        self.use_rs_wrap = (moe_mode == "ep") and (get_tp_group().world_size > 1)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass for MoE layer.
 
@@ -179,35 +226,28 @@ class MoELayer(nn.Module):
         Returns:
             [N, hidden_size] output after expert computation and merge.
         """
-        # 1. Router
         scores = self.gate(hidden_states)               # [N, num_experts]
-        weights, indices = self._topk_routing(scores)      # [N, top_k] each
+        weights, indices = self._topk_routing(scores)   # [N, top_k] each
 
+        if self.ep_size == 1:
+            # ep_size==1 无通信：两模式退化为全专家本地全量计算（数学等价）；
+            # 该配置构造走个体专家分支（无 stacked_*_tp），统一走 local 路径。
+            return self._forward_ep_local(hidden_states, weights, indices)
         if self.moe_mode == "ep":
-            if self.ep_size == 1:
-                # No communication needed — use the efficient local path.
-                return self._forward_ep_local(hidden_states, weights, indices)
-            if self.comm_mode == "all_gather":
-                return self._forward_ep_ag(hidden_states, weights, indices)
-            elif self.comm_mode == "all_to_all":
-                return self._forward_ep_ata(hidden_states, weights, indices)
-            elif self.comm_mode == "zero_a2a":
-                return self._forward_ep_za2a(hidden_states, weights, indices)
-            else:  # "auto"
-                # During CUDA Graph capture, use the graph-compatible zero_a2a
-                # path; otherwise use the bandwidth-optimal all_to_all path.
-                if torch.cuda.is_current_stream_capturing():
-                    return self._forward_ep_za2a(hidden_states, weights, indices)
-                else:
-                    return self._forward_ep_ata(hidden_states, weights, indices)
-        else:
-            return self._forward_tp(hidden_states, weights, indices)
+            # §2.2 分流：输入为 RS 后 [N/TP, D]（N 指全局 batch）→ 局部换算
+            # N_local × K ≤ 2048/TP 走 fixbuf（decode 主路径），否则走动态 a2a（prefill）。
+            if hidden_states.size(0) * self.top_k <= 2048 // self.tp_size:
+                return self._forward_ep_a2a_fixbuf(hidden_states, weights, indices)
+            return self._forward_ep_a2a_eager(hidden_states, weights, indices)
+        # moe_mode == "tp"（此处 ep_size > 1，stacked_*_tp 恒存在）：
+        # §2.1 AllReduce 后端，全 token 本地计算 + AR[EP]（+ AG[DP]/slice）
+        return self._forward_tp(hidden_states, weights, indices)
 
     # ------------------------------------------------------------------
-    # EP mode (all_to_all): dispatch → compute → combine
+    # EP mode (All2All, eager / prefill): dispatch → compute → combine
     # ------------------------------------------------------------------
 
-    def _forward_ep_ata(
+    def _forward_ep_a2a_eager(
         self,
         hidden_states: torch.Tensor,
         weights: torch.Tensor,
@@ -302,110 +342,119 @@ class MoELayer(nn.Module):
 
         return output
 
-    # ------------------------------------------------------------------
-    # EP mode (all_gather): AllGather → slot-dispatch → ReduceScatter
-    #
-    # CUDA-Graph-compatible: every tensor shape is determined solely by
-    # the (fixed) batch size N.  Slot dispatch uses cumsum + index_add_
-    # instead of nonzero/dynamic-indexing so the entire forward pass can
-    # be captured by torch.cuda.CUDAGraph for decode-phase acceleration.
-    # ------------------------------------------------------------------
+    def _forward_ep_a2a_fixbuf(self, hidden_states, weights, indices):
+        """§2.2 moe_ep decode 主路径：RS 后 [N/TP, D] → 固定容量 a2a 两跳。
 
-    def _forward_ep_ag(
-        self,
-        hidden_states: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """AllGather-based EP forward — graph-capturable, no dynamic splits.
-
-        Flow:
-          1. AllGather hidden_states, weights, indices → all ranks see all tokens
-          2. Fixed-capacity slot dispatch: cumsum assigns consecutive slots per
-             expert; index_add_ copies tokens into fixed-size per-expert buffers.
-          3. ExpertFFN on fixed-size buffers (graph-capturable matmuls).
-          4. Gather results back + weighted accumulate.
-          5. ReduceScatter to return local-token slices.
+        数据流（行序保持链，全程固定 shape + 固定 split，无 .tolist()/.item()）：
+          1. dispatch 对齐（block_id=target_rank+1）→ send_buf 块 i（1-based）= 发往
+             rank i-1 的 pair；send_e_buf 同时 scatter 哨兵 e+1（无效 pair 落 null 块）；
+          2. 正向 a2a ×3（token / expert_id / 路由权重三通道，split=[send_CAP]*EP）；
+          3. compute 对齐：recv 行序天然按 source_rank 分块，block_id=local_exp+1
+             （与 moe_tp 统一约定：专家 e → block e+1）→ x_align/w_align；
+          4. moe_ffn_pair（全量权重，kernel 内乘路由权重 w）；
+          5. gather-back：out_align[recv_pos] 恢复 recv 行序 → 复用 send_buf[send_CAP:]；
+          6. 逆向 a2a：结果按 source_rank 分块回源（result 复用 recv_buf）；
+          7. 源端 send_pos（含 null 段偏移）直接归组 → 直接 sum 不除 Σw。
         """
         N, D = hidden_states.shape
         K = self.top_k
-
-        # --- ep_size=1 shortcut (no communication) ---
-        if self.ep_size == 1:
-            return self._forward_ep_local(hidden_states, weights, indices)
-
-        ep_group = get_ep_group()
         E = self.ep_size
+        device, dtype = hidden_states.device, hidden_states.dtype
+        ep_group = get_ep_group()
 
-        # --- Phase 1: AllGather ---
-        # All ranks now hold the full token set [N*E, ...]
-        global_hidden = ep_group.all_gather(hidden_states, dim=0)   # [N*E, D]
-        global_weights = ep_group.all_gather(weights, dim=0)         # [N*E, K]
-        global_indices = ep_group.all_gather(indices, dim=0)         # [N*E, K]
+        if N == 0:
+            return hidden_states
 
-        N_all = N * E
+        # ---- expand + EP mapping ----
+        NK = N * K
+        x_flat = hidden_states.unsqueeze(1).expand(-1, K, -1).reshape(NK, D)
+        w_flat = weights.reshape(NK)
+        target_rank = indices.reshape(NK) // self.experts_per_rank   # [NK] 0..EP-1
+        local_exp = indices.reshape(NK) % self.experts_per_rank       # [NK] 0..E_local-1
 
-        # --- Phase 2: expert routing (all fixed-shape elementwise ops) ---
-        # global_indices are global expert IDs (0 .. num_experts-1)
-        owner_rank = global_indices // self.experts_per_rank          # [N_all, K]
-        local_exp_id = global_indices % self.experts_per_rank         # [N_all, K]
-        is_local = (owner_rank == self.ep_rank)                       # [N_all, K]
+        # ---- CAP（3σ Chernoff，对齐 BLOCK_M，上界夹紧到 NK）----
+        send_CAP = _cap_from_expected(3 * NK // E, NK)
+        recv_CAP = _cap_from_expected(3 * NK // self.num_experts, NK)
 
-        # Flatten to [N_all*K, ...] for slot dispatch
-        hidden_flat = global_hidden.unsqueeze(1).expand(-1, K, -1).reshape(-1, D)
-        weights_flat = global_weights.reshape(-1)                     # [N_all*K]
-        is_local_flat = is_local.reshape(-1)                          # [N_all*K]
-        local_exp_flat = local_exp_id.reshape(-1)                     # [N_all*K]
+        # ---- 取缓存（dispatch / compute 两个条目）+ 本轮参与 buffer 清零 ----
+        bufs_send = get_or_create_moe_buffers(
+            "fixbuf", device, dtype, N, D,
+            T_MAX=(E + 1) * send_CAP, num_blocks=E, CAP=send_CAP)
+        bufs_compute = get_or_create_moe_buffers(
+            "fixbuf", device, dtype, N, D,
+            T_MAX=(self.experts_per_rank + 1) * recv_CAP,
+            num_blocks=self.experts_per_rank, CAP=recv_CAP)
+        # 对完整 buffer zero_（[send_CAP:] 是 view，自动覆盖）；e_align 为静态哨兵不参与
+        for buf in (bufs_send["send_buf"], bufs_send["send_e_buf"], bufs_send["send_w_buf"],
+                    bufs_send["recv_buf"], bufs_send["recv_e_buf"], bufs_send["recv_w_buf"],
+                    bufs_send["x_align"], bufs_send["w_align"], bufs_send["cnt"],
+                    bufs_compute["x_align"], bufs_compute["w_align"], bufs_compute["cnt"]):
+            buf.zero_()
 
-        N_flat = N_all * K
+        # ---- dispatch 对齐：block_id = target_rank+1，块 1..EP = 目标 rank 0..EP-1 ----
+        send_pos, send_keep = moe_align(
+            x_flat, w_flat,
+            valid_mask=torch.ones(NK, dtype=torch.int32, device=device),
+            block_ids=(target_rank + 1).to(torch.int64),
+            x_align=bufs_send["send_buf"], w_align=bufs_send["send_w_buf"],
+            cnt=bufs_send["cnt"],
+            NUM_BLOCKS=E, CAP=send_CAP)
 
-        # --- Phase 3: capacity calculation ---
-        # Capacity: allocate enough slots per expert so overflow probability
-        # is negligible.  Expected tokens per expert = N_flat / num_experts.
-        # With capacity = 3× expected, Chernoff bound gives P(overflow) < 10⁻⁷⁴
-        # for balanced routing in the decode regime (N ≤ 512).
-        expected = max(N_flat // self.num_experts, 1)
-        capacity = min(expected * 3, N_flat)   # never exceed total tokens
-        capacity = max(capacity, 64)            # floor at 64 slots
+        # ---- send_e_buf 填充（保持门控：无效 pair 落 null 块行 0，防污染 recv 端）----
+        safe_pos = torch.where(send_keep.bool(), send_pos, torch.zeros_like(send_pos))
+        bufs_send["send_e_buf"].scatter_(
+            0, safe_pos,
+            torch.where(send_keep.bool(), local_exp + 1, torch.zeros_like(local_exp)))
 
-        # --- Phase 3b: per-expert dispatch + compute ---
-        # Per-expert matmul (not bmm): use [capacity, D] temporary per expert,
-        # re-used across the loop.  Memory = capacity × D ≈ 1.5 MB vs bmm's
-        # [E, capacity, D] ≈ 48 MB.  CUDA Graph eliminates per-iteration kernel
-        # launch overhead, so bmm's fusion benefit is marginal here.
-        output = torch.zeros(N_all, D, dtype=hidden_states.dtype,
-                             device=hidden_states.device)
-        E = self.experts_per_rank
-        expert_buffer = torch.zeros(capacity, D,
-                                    dtype=hidden_states.dtype,
-                                    device=hidden_states.device)
+        # ---- 正向 a2a ×3（token / expert_id / 路由权重，固定 split → graph 可捕获）----
+        # 有效区 = [send_CAP, (E+1)*send_CAP) 共 E*send_CAP 行（null 块占 [0, send_CAP)，
+        # CAP 行宽而非 1 行，不参与 a2a）
+        split = [send_CAP] * E
+        dist.all_to_all_single(bufs_send["recv_buf"][send_CAP:], bufs_send["send_buf"][send_CAP:],
+                               output_split_sizes=split, input_split_sizes=split,
+                               group=ep_group.device_group)
+        dist.all_to_all_single(bufs_send["recv_e_buf"][send_CAP:], bufs_send["send_e_buf"][send_CAP:],
+                               output_split_sizes=split, input_split_sizes=split,
+                               group=ep_group.device_group)
+        dist.all_to_all_single(bufs_send["recv_w_buf"][send_CAP:], bufs_send["send_w_buf"][send_CAP:],
+                               output_split_sizes=split, input_split_sizes=split,
+                               group=ep_group.device_group)
 
-        for e in range(E):                                   # fixed iteration count
-            mask = is_local_flat & (local_exp_flat == e)     # [N_flat]
-            slot_idx = torch.cumsum(mask.int(), dim=0) - 1   # [N_flat]
-            safe_idx = slot_idx.clamp(0, capacity - 1)       # [N_flat]
-            mask_float = mask.to(hidden_flat.dtype).unsqueeze(-1)
+        # ---- compute 对齐：输入行序 = recv 行序（按 source_rank 分块）----
+        # 统一 block_id 约定（§5.2）：专家 e → block e+1（block 0 = null）。
+        # recv_e_buf 哨兵 = local_exp+1，无效行 0 → clamp(min=1)-1 得裸 local_exp
+        # （无效行 → 0；valid_mask=0 时 kernel 不读 block_id），再 +1 对齐到 block 号。
+        recv_e_flat = bufs_send["recv_e_buf"][send_CAP:]
+        recv_valid = (recv_e_flat > 0).to(torch.int32)
+        recv_local_exp = recv_e_flat.clamp(min=1) - 1          # 无效行 → 0（valid_mask=0 时不读 block_id）
+        recv_pos, recv_keep = moe_align(
+            bufs_send["recv_buf"][send_CAP:], bufs_send["recv_w_buf"][send_CAP:],
+            valid_mask=recv_valid, block_ids=recv_local_exp + 1,
+            x_align=bufs_compute["x_align"], w_align=bufs_compute["w_align"],
+            cnt=bufs_compute["cnt"],
+            NUM_BLOCKS=self.experts_per_rank, CAP=recv_CAP)
 
-            # Fill per-expert buffer
-            expert_buffer.zero_()
-            expert_buffer.index_add_(0, safe_idx, hidden_flat * mask_float)
+        # ---- fused compute（全量权重；kernel 内乘路由权重 w，源端不再乘）----
+        moe_ffn_pair(bufs_compute["x_align"], self.stacked_gate, self.stacked_up,
+                     self.stacked_down, bufs_compute["w_align"], bufs_compute["e_align"],
+                     bufs_compute["out_align"], M=self.moe_intermediate_size, D=D)
 
-            # Per-expert FFN (uses stacked weight for fast lookup)
-            gate = torch.mm(expert_buffer, self.stacked_gate[e].t())
-            up   = torch.mm(expert_buffer, self.stacked_up[e].t())
-            out_e = torch.mm(F.silu(gate) * up, self.stacked_down[e].t())
-            # out_e: [capacity, D]
+        # ---- gather-back：out_align[recv_pos] 恢复 recv 行序 → 复用 send_buf[send_CAP:] ----
+        out_flat = bufs_compute["out_align"][recv_pos] * recv_keep.to(dtype).unsqueeze(-1)
+        bufs_send["send_buf"][send_CAP:].copy_(out_flat)
 
-            # Gather results
-            gathered = out_e[safe_idx] * mask_float          # [N_flat, D]
-            w = weights_flat.unsqueeze(-1) * mask_float       # [N_flat, 1]
-            gathered = gathered * w
+        # ---- 逆向 a2a：结果按 source_rank 分块回源；result 复用 recv_buf[send_CAP:] ----
+        dist.all_to_all_single(bufs_send["recv_buf"][send_CAP:], bufs_send["send_buf"][send_CAP:],
+                               output_split_sizes=split, input_split_sizes=split,
+                               group=ep_group.device_group)
 
-            gathered_3d = gathered.reshape(N_all, K, D)
-            output += gathered_3d.sum(dim=1)                  # [N_all, D]
-
-        # --- Phase 4: ReduceScatter ---
-        return ep_group.reduce_scatter(output, dim=0)         # [N, D]
+        # ---- 源端归组：send_pos 含 null 段偏移，直接索引；直接 sum（w 已在 kernel 内乘）。
+        # fp32 累加后一次性舍入 bf16（省两次中间舍入，数值贴近参考实现，R3）----
+        result = bufs_send["recv_buf"][send_pos].float() \
+            * send_keep.float().unsqueeze(-1)                                          # [NK, D] fp32
+        bufs_compute["partial"].zero_()
+        bufs_compute["partial"].copy_(result.reshape(N, K, D).sum(dim=1).to(dtype))
+        return bufs_compute["partial"]
 
     # ------------------------------------------------------------------
     # Shared local path (ep_size=1): no communication needed
@@ -432,227 +481,68 @@ class MoELayer(nn.Module):
         output = (output_3d * weights_3d.unsqueeze(-1)).sum(dim=1)
         return output
 
-    # ------------------------------------------------------------------
-    # TP mode: all-gather → compute → reduce-scatter
-    # ------------------------------------------------------------------
-
     def _forward_tp(
         self,
         hidden_states: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
     ) -> torch.Tensor:
-        N, D = hidden_states.shape
-        K = self.top_k
-        ep_group = get_ep_group()
+        """§2.1 moe_tp（AllReduce 后端）：全 token 本地计算 + AR[EP]（+ AG[DP]/slice）。
 
-        # All-gather: share all tokens across EP ranks
-        all_tokens = ep_group.all_gather(hidden_states, dim=0)  # [N*ep_size, D]
-
-        # Each rank computes its TP shard for all experts × all tokens
-        partial = self._compute_all_experts_tp(all_tokens, weights, indices)
-
-        # Reduce-scatter: split results back to original ranks
-        output = ep_group.reduce_scatter(partial, dim=0)  # [N, D]
-        return output
-
-    # ------------------------------------------------------------------
-    # EP mode (zero_a2a): local compute + all_reduce combine
-    #
-    # Under DP=1 (all ranks hold identical tokens) there is no need to
-    # dispatch tokens at all.  Each rank computes partial expert outputs
-    # only for the experts it owns, writing zeros for non-local (t,k)
-    # pairs.  A single AllReduce then sums the partials across EP ranks.
-    #
-    # Tokens are aligned into fixed-capacity expert blocks (CAP per
-    # expert + 1 null block) so every tensor shape depends only on the
-    # (fixed) batch size N → fully CUDA-Graph capturable.
-    #
-    # Buffers are shared across all MoE layers via a module-level cache
-    # (_get_or_create_za2a_buffers) — all layers have identical D and
-    # N, so alignment shapes are identical.
-    # ------------------------------------------------------------------
-
-    def _forward_ep_za2a(
-        self,
-        hidden_states: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Zero-A2A EP forward — CUDA-Graph capturable, no token dispatch.
-
-        Flow:
-          1. Expand hidden_states to [N*K, D] and map each (token, topk)
-             pair to its local expert id (or -1 for non-local).
-          2. Scatter pairs into fixed-capacity per-expert blocks (one block
-             per local expert + one null block for non-local tokens).
-             Every tensor shape depends only on N → graph-safe.
-          3. Single fused Triton kernel (gate/up → SiLU → down → route
-             weight multiply) over the aligned buffer.
-          4. Inverse-gather results back to original (t,k) order, merge
-             across top-k, and AllReduce partials across EP ranks.
+        数据流：
+          DP>1 时 AG[DP] 前置（AG 顺序 = dp 升序 = slice 块序，R6），在 N_total 上重路由；
+          权重沿 M 维切 EP 份（stacked_*_tp，M/EP）→ moe_align（mask=全1,
+          block_id=全局 expert+1, 129 块）→ moe_ffn_pair（M/EP）→
+          partial [N_total, D]（每 rank 只含其唯一 M 切片的贡献）→ AR[EP] 全组归约
+          （AR[TP] 只补 TP 组内切片，缺其他 DP 组的切片，语义错误）→
+          DP>1 时本地 slice 取回本 DP 行块（零通信）。
         """
         N, D = hidden_states.shape
         K = self.top_k
+        device, dtype = hidden_states.device, hidden_states.dtype
+        ep_group = get_ep_group()
+        dp_size = self.ep_size // self.tp_size               # EP group = 全体 rank
 
-        if self.ep_size == 1:
-            return self._forward_ep_local(hidden_states, weights, indices)
-        if N == 0:
+        if dp_size > 1:
+            all_tokens = get_dp_group().all_gather(hidden_states, dim=0)   # AG[DP] 前置
+        else:
+            all_tokens = hidden_states
+        N_total = all_tokens.size(0)
+        if N_total == 0:
             return hidden_states
 
-        # ---- threshold: small batch → bmm path (CAP=N, zero overflow) ----
-        # torch.topk returns K *distinct* experts per token, so per-expert
-        # load is bounded by N.  CAP = N guarantees no capacity drop.
-        # For larger batches the Triton alignment path has better padding
-        # efficiency (BLOCK_M-aligned CAP vs 4× padding of bmm path).
-        if N * K <= 512:   # N ≤ 64 for K=8
-            return self._forward_ep_za2a_bmm(hidden_states, weights, indices)
+        all_weights, all_indices = self._topk_routing(self.gate(all_tokens))   # N_total 上重路由
+        NK = N_total * K
+        x_flat = all_tokens.unsqueeze(1).expand(-1, K, -1).reshape(NK, D)
+        w_flat = all_weights.reshape(NK)
+        e_flat = all_indices.reshape(NK)                     # 全局 expert id
 
-        E_local = self.experts_per_rank
-        NK = N * K
-        ep_group = get_ep_group()
+        tp_CAP = _cap_from_expected(3 * NK // self.num_experts, NK)
+        bufs = get_or_create_moe_buffers(
+            "moe_tp", device, dtype, N_total, D,
+            T_MAX=(self.num_experts + 1) * tp_CAP, num_blocks=self.num_experts, CAP=tp_CAP)
+        bufs["x_align"].zero_(); bufs["w_align"].zero_(); bufs["cnt"].zero_()
 
-        # ---- capacity: fixed-size blocks, graph-safe ----
-        # Expected tokens per (global) expert = NK / num_experts.
-        # CAP = ceil(3 × expected / BLOCK_M) × BLOCK_M, floor BLOCK_M.
-        # Overflow probability is negligible per Chernoff bound (same
-        # argument as the all_gather path).
-        expected = (3 * NK + self.num_experts - 1) // self.num_experts
-        CAP = max(((expected + BLOCK_M - 1) // BLOCK_M) * BLOCK_M, BLOCK_M)
-        T_MAX = (E_local + 1) * CAP
+        pos, keep = moe_align(
+            x_flat, w_flat,
+            valid_mask=torch.ones(NK, dtype=torch.int32, device=device),
+            block_ids=(e_flat + 1).to(torch.int64),
+            x_align=bufs["x_align"], w_align=bufs["w_align"], cnt=bufs["cnt"],
+            NUM_BLOCKS=self.num_experts, CAP=tp_CAP)
 
-        # Reuse buffers across layers: use module-level cache keyed by
-        # (D, T_MAX) so all 48 MoE layers share the same alignment buffers.
-        bufs = _get_or_create_za2a_buffers(hidden_states.device,
-                                           hidden_states.dtype, N, D, T_MAX, E_local)
+        moe_ffn_pair(bufs["x_align"], self.stacked_gate_tp, self.stacked_up_tp,
+                     self.stacked_down_tp, bufs["w_align"], bufs["e_align"],
+                     bufs["out_align"], M=self.moe_intermediate_size // self.ep_size, D=D)
 
-        # ---- 1. expand + route mapping (all fixed-shape) ----
-        x_flat = hidden_states.unsqueeze(1).expand(-1, K, -1).reshape(NK, D)
-        e_global = indices.reshape(NK)
-        is_local_bool = (e_global // E_local) == self.ep_rank      # [NK] bool
-        is_local = is_local_bool.to(torch.int32)                     # [NK] int32 for Triton
-        local_exp = torch.where(is_local_bool, e_global % E_local, -1)  # [NK] int64
-        w_flat = weights.reshape(NK)
-
-        # ---- 2. alignment: 1 Triton kernel replaces ~100 scatter launches ----
-        # Pre-zero the align buffers (padding rows remain zero → FFN kernel
-        # computes on zero data, producing zero output for empty slots).
-        bufs["x_align"].zero_()
-        bufs["w_align"].zero_()
-        bufs["cnt"].zero_()
-
-        pos_flat, keep = moe_align(
-            x_flat, w_flat, is_local, local_exp,
-            bufs["x_align"], bufs["w_align"], bufs["cnt"],
-            E_local, CAP,
-        )
-
-        # Fill e_align sentinels (once per buffer at creation time).
-        # Null block = 0, expert e block = e+1.
-        if not bufs.get("_e_init"):
-            for e in range(E_local):
-                bufs["e_align"][e * CAP:(e + 1) * CAP] = e + 1
-            bufs["_e_init"] = True
-
-        # ---- 3. fused Triton kernel (single launch) ----
-        moe_ffn_pair(
-            bufs["x_align"], self.stacked_gate, self.stacked_up, self.stacked_down,
-            bufs["w_align"], bufs["e_align"], bufs["out_align"],
-            M=self.moe_intermediate_size, D=D,
-        )
-
-        # ---- 4. inverse-gather + merge ----
-        # pos_flat is the absolute row index (computed by the align kernel).
-        # keep=0 for non-local and overflow pairs → zero contribution.
-        keep_flat = keep.to(hidden_states.dtype)                     # [NK] bf16 (0. or 1.)
-        out_flat = bufs["out_align"][pos_flat] * keep_flat.unsqueeze(-1)   # [NK, D]
-
+        # fp32 累加后一次性舍入 bf16（与 fixbuf 路径同一数值约定，R3）
+        out_flat = bufs["out_align"][pos].float() * keep.float().unsqueeze(-1)
         bufs["partial"].zero_()
-        bufs["partial"].copy_(out_flat.reshape(N, K, D).sum(dim=1))   # [N, D]
+        bufs["partial"].copy_(out_flat.reshape(N_total, K, D).sum(dim=1).to(dtype))
+        ep_group.all_reduce(bufs["partial"])                 # AR[EP] 全体 rank（必须全组）
 
-        # ---- 5. zero-a2a combine: AllReduce partials across EP ranks ----
-        ep_group.all_reduce(bufs["partial"])         # in-place
-        return bufs["partial"]
-
-    def _forward_ep_za2a_bmm(
-        self,
-        hidden_states: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Zero-A2A decode-optimised path: torch.bmm instead of Triton kernel.
-
-        Uses CAP = N (provably zero overflow — topk returns K distinct
-        experts per token) and batched matmul across all local experts:
-
-            x3d [E_local, CAP, D] @ W^T → gate/up [E_local, CAP, M]
-            silu(gate)*up @ W_down → out [E_local, CAP, D]
-
-        This eliminates the 95% padding waste of the BLOCK_M-aligned path
-        for small N and leverages cuBLAS tensor cores.
-        """
-        N, D = hidden_states.shape
-        K = self.top_k
-        if self.ep_size == 1:
-            return self._forward_ep_local(hidden_states, weights, indices)
-        if N == 0:
-            return hidden_states
-
-        E_local = self.experts_per_rank
-        NK = N * K
-        ep_group = get_ep_group()
-
-        # CAP = N: per-expert load ≤ N (each token contributes at most 1
-        # pair to any expert because topk picks K *distinct* experts).
-        CAP = N
-        T_MAX = (E_local + 1) * CAP
-
-        bufs = _get_or_create_za2a_buffers(hidden_states.device,
-                                           hidden_states.dtype, N, D, T_MAX, E_local)
-
-        # ---- 1. expand + route mapping ----
-        x_flat = hidden_states.unsqueeze(1).expand(-1, K, -1).reshape(NK, D)
-        e_global = indices.reshape(NK)
-        is_local_bool = (e_global // E_local) == self.ep_rank      # [NK] bool
-        is_local = is_local_bool.to(torch.int32)                     # [NK] int32 for Triton
-        local_exp = torch.where(is_local_bool, e_global % E_local, -1)  # [NK] int64
-        w_flat = weights.reshape(NK)
-
-        # ---- 2. alignment: 1 Triton kernel replaces scatter loop ----
-        # Note: w_align is written by moe_align but unused by bmm — harmless dead write.
-        bufs["x_align"].zero_()
-        bufs["cnt"].zero_()
-
-        pos_flat, keep = moe_align(
-            x_flat, w_flat, is_local, local_exp,
-            bufs["x_align"], bufs["w_align"], bufs["cnt"],
-            E_local, CAP,
-        )
-
-        # ---- 3. bmm FFN (replaces Triton kernel) ----
-        # x3d: [E_local, CAP, D] — view of x_align, expert blocks 1..E_local
-        x3d = bufs["x_align"].view(E_local + 1, CAP, D)[1:]        # [E, C, D]
-
-        gate = torch.bmm(x3d, self.stacked_gate.transpose(1, 2))    # [E, C, M]
-        up   = torch.bmm(x3d, self.stacked_up.transpose(1, 2))      # [E, C, M]
-        y    = F.silu(gate) * up                                      # [E, C, M] bf16
-        out3d = torch.bmm(y, self.stacked_down.transpose(1, 2))      # [E, C, D]
-
-        # out3d_view writes into the [1:] slice of out_align
-        out3d_view = bufs["out_align"].view(E_local + 1, CAP, D)[1:]
-        out3d_view.copy_(out3d)
-
-        # ---- 4. inverse-gather + merge (route weights applied here) ----
-        # pos_flat is the absolute row index (computed by the align kernel).
-        # keep=0 for non-local and overflow pairs → zero contribution.
-        keep_flat = keep.to(hidden_states.dtype)
-        out_flat = bufs["out_align"][pos_flat] * (w_flat * keep_flat).unsqueeze(-1)
-
-        bufs["partial"].zero_()
-        bufs["partial"].copy_(out_flat.reshape(N, K, D).sum(dim=1))
-
-        # ---- 5. all-reduce combine ----
-        ep_group.all_reduce(bufs["partial"])
+        if dp_size > 1:
+            j = get_dp_group().rank_in_group                 # R6：AG 顺序 = dp 升序 = slice 块序
+            return bufs["partial"].narrow(0, j * N, N)
         return bufs["partial"]
 
     # ------------------------------------------------------------------
@@ -731,43 +621,3 @@ class MoELayer(nn.Module):
         # --- Restore original order ---
         unsort_idx = torch.argsort(sort_idx)
         return output_sorted[unsort_idx]
-
-    def _compute_all_experts_tp(
-        self,
-        all_tokens: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """TP-mode: compute all experts on all tokens (partial result per rank).
-
-        Each rank holds a TP shard of every expert's weight. The result is a
-        partial sum that will be reduced across ranks.
-
-        Args:
-            all_tokens: [total_tokens, hidden_size] all-gathered tokens.
-            weights: [N, top_k] from the local batch (needed for merge).
-            indices: [N, top_k] from the local batch.
-
-        Returns:
-            [total_tokens, hidden_size] partial output.
-        """
-        total_tokens = all_tokens.size(0)
-        K = self.top_k
-        D = self.hidden_size
-
-        # For TP mode, each rank has all experts (with TP-sharded weights).
-        # Compute expert outputs for all tokens.
-        all_weights, all_indices = self._topk_routing(self.gate(all_tokens))
-
-        # Flatten for per-expert compute
-        tokens_flat = all_tokens.unsqueeze(1).expand(-1, K, -1).reshape(-1, D)
-        exp_ids_flat = all_indices.reshape(-1)
-        weights_flat = all_weights.reshape(-1)
-
-        # Group by expert and compute
-        expert_outputs = self._compute_local(tokens_flat, exp_ids_flat)
-
-        # Weighted merge
-        outputs_3d = expert_outputs.reshape(total_tokens, K, D)
-        weights_3d = weights_flat.reshape(total_tokens, K)
-        return (outputs_3d * weights_3d.unsqueeze(-1)).sum(dim=1)

@@ -198,4 +198,4 @@ cython_debug/
 .claude
 
 # remove test file (not final test files)
-.tests/
+tests/

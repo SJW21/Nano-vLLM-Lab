@@ -14,7 +14,6 @@ class Config:
     tensor_parallel_size: int = 1
     expert_parallel_size: int = 1
     moe_mode: str = "ep"
-    ep_comm_mode: str = "auto"  # "auto" | "all_gather" | "all_to_all" | "zero_a2a"
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
@@ -37,7 +36,9 @@ class Config:
         assert self.expert_parallel_size in (1, self.data_parallel_size * self.tensor_parallel_size), \
             "EP size must be 1 (disabled) or equal to dp_size * tp_size"
         assert self.moe_mode in ("ep", "tp"), "moe_mode must be 'ep' or 'tp'"
-        assert self.ep_comm_mode in ("auto", "all_gather", "all_to_all", "zero_a2a"), \
-            "ep_comm_mode must be 'auto', 'all_gather', 'all_to_all', or 'zero_a2a'"
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.moe_mode == "tp" and self.hf_config.model_type == "qwen3_moe":
+            m_inter = self.hf_config.moe_intermediate_size
+            assert m_inter % self.expert_parallel_size == 0, \
+                f"moe_mode='tp' 要求 moe_intermediate_size ({m_inter}) 能被 EP ({self.expert_parallel_size}) 整除（R8）"
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

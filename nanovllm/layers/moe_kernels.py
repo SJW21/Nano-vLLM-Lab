@@ -115,10 +115,11 @@ def moe_ffn_pair_kernel(
             x = tl.load(x_ptr + rows[:, None] * D + dk[None, :])
 
             # wg_t, wu_t: [BLOCK_K, BLOCK_M] bf16
-            # offset = e0*M*D + dk[:, None]*M + m_off[None, :]
-            wg_t = tl.load(wg_base + dk[:, None] * M + m_off[None, :],
+            # 存储 [E, M, D]（m-major，nn.Linear 惯例）：wg_t[d, m] = wg[e0, m, d]
+            # → offset = e0*M*D + m_off[None, :]*D + dk[:, None]
+            wg_t = tl.load(wg_base + m_off[None, :] * D + dk[:, None],
                            mask=m_mask[None, :], other=0.)
-            wu_t = tl.load(wu_base + dk[:, None] * M + m_off[None, :],
+            wu_t = tl.load(wu_base + m_off[None, :] * D + dk[:, None],
                            mask=m_mask[None, :], other=0.)
 
             g = tl.dot(x, wg_t, acc=g)         # fp32 accumulate
@@ -152,36 +153,36 @@ def moe_ffn_pair_kernel(
 def moe_align_kernel(
     x_ptr,           # [NK, D] bf16   — flat token hidden states
     w_ptr,           # [NK] bf16      — flat routing weights
-    is_local_ptr,    # [NK] int32     — 1 if expert is on this rank
-    local_exp_ptr,   # [NK] int64     — local expert id (0..E_LOCAL-1), invalid for non-local
+    valid_mask_ptr,  # [NK] int32     — 1 if the pair should be aligned (sent to a block)
+    block_ids_ptr,   # [NK] int64     — target block id (1..NUM_BLOCKS), computed by caller
     pos_ptr,         # [NK] int64     — output: absolute row in x_align/w_align for gather
-    keep_ptr,        # [NK] int32     — output: 1 = valid pair, 0 = non-local or overflow
-    cnt_ptr,         # [E_LOCAL+1] int32 — atomic slot counters (pre-zeroed)
+    keep_ptr,        # [NK] int32     — output: 1 = valid pair, 0 = masked-out or overflow
+    cnt_ptr,         # [NUM_BLOCKS+1] int32 — atomic slot counters (pre-zeroed)
     x_align_ptr,     # [T_MAX, D] bf16 — output: aligned token buffer
     w_align_ptr,     # [T_MAX] bf16    — output: aligned weight buffer
-    E_LOCAL: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
     CAP: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Align (token, topk) pairs into fixed-capacity expert blocks.
+    """Align (token, topk) pairs into fixed-capacity blocks.
 
-    Each program handles one (token, topk) pair.  Local pairs atomically
-    allocate a slot in their expert's block; non-local pairs return early
-    (contribute zero through the keep mask later).
+    Each program handles one (token, topk) pair.  Valid pairs (valid_mask=1)
+    atomically allocate a slot in their target block; masked pairs return
+    early (contribute zero through the keep mask later).  block_id=0 is
+    reserved as the null block and must never be used by valid pairs.
     """
     pid = tl.program_id(0)                     # 0 .. NK-1
-    is_local = tl.load(is_local_ptr + pid)
-    if is_local == 0:
-        # Non-local pair → zero contribution; store safe defaults
+    valid = tl.load(valid_mask_ptr + pid)
+    if valid == 0:
+        # Masked pair → zero contribution; store safe defaults
         tl.store(pos_ptr + pid, 0)
         tl.store(keep_ptr + pid, 0)
         return
 
-    e = tl.load(local_exp_ptr + pid)            # 0 .. E_LOCAL-1
-    block_id = e + 1                            # 1 .. E_LOCAL  (0 = null block)
+    block_id = tl.load(block_ids_ptr + pid)     # 1 .. NUM_BLOCKS (caller-computed)
 
-    # ---- atomic slot allocation within the expert's block ----
+    # ---- atomic slot allocation within the block ----
     slot = tl.atomic_add(cnt_ptr + block_id, 1)
 
     if slot >= CAP:
@@ -207,41 +208,58 @@ def moe_align_kernel(
     tl.store(w_align_ptr + base_row, w)
 
 
-def moe_align(x_flat, w_flat, is_local, local_exp, x_align, w_align, cnt,
-              E_LOCAL, CAP, BLOCK_D=128, num_warps=4, num_stages=2):
-    """Align (token,topk) pairs into fixed-capacity expert blocks.
+def moe_align(x_flat, w_flat, valid_mask, block_ids, x_align, w_align, cnt,
+              NUM_BLOCKS, CAP, BLOCK_D=128, num_warps=4, num_stages=2):
+    """Align (token,topk) pairs into fixed-capacity blocks.
 
     Single Triton kernel replaces the Python scatter-loop (~100 launches).
+
+    三处调用语义（moe_refactor_plan §5.2）：
+      1. moe_ep dispatch 对齐：valid_mask = 1（所有 pair 都要发），
+         block_ids = ep_rank_target + 1（目标 rank 索引 + 1，null 块 0 保留）；
+      2. moe_ep compute 对齐：valid_mask = is_local，
+         block_ids = local_expert_id + 1；
+      3. moe_tp 计算：valid_mask = 全 1，
+         block_ids = 全局 expert_id + 1（129 块布局 = 128 专家 + 1 null）。
 
     Args:
         x_flat:     [NK, D] bf16  — flat token hidden states
         w_flat:     [NK] bf16     — flat routing weights
-        is_local:   [NK] int32    — 1 if expert is on this rank
-        local_exp:  [NK] int64    — local expert id (0..E_LOCAL-1; invalid for non-local)
+        valid_mask: [NK] int32    — 1 if the pair should be aligned
+        block_ids:  [NK] int64    — target block id, caller-computed (1..NUM_BLOCKS)
         x_align:    [T_MAX, D] bf16 — output buffer (must be pre-zeroed)
         w_align:    [T_MAX] bf16    — output buffer (must be pre-zeroed)
-        cnt:        [E_LOCAL+1] int32 — atomic counters (must be pre-zeroed)
-        E_LOCAL:    int           — number of local experts
-        CAP:        int           — capacity slots per expert block
+        cnt:        [NUM_BLOCKS+1] int32 — atomic counters (must be pre-zeroed)
+        NUM_BLOCKS: int           — number of valid blocks (block_id 0 = null, reserved)
+        CAP:        int           — capacity slots per block
 
     Returns:
         pos:  [NK] int64 — absolute row index in align buffers (for inverse-gather)
-        keep: [NK] int32 — 1 = valid pair, 0 = non-local or overflow
+        keep: [NK] int32 — 1 = valid pair, 0 = masked-out or overflow
     """
     NK, D = x_flat.shape
-    T_MAX = (E_LOCAL + 1) * CAP
+    T_MAX = (NUM_BLOCKS + 1) * CAP
     assert T_MAX == x_align.shape[0], f"T_MAX mismatch: {T_MAX} vs {x_align.shape[0]}"
     assert D % BLOCK_D == 0, f"D ({D}) must be a multiple of BLOCK_D ({BLOCK_D})"
+    # capture 期间跳过 host 断言：.item() 是 host sync，CUDA Graph capture 内
+    # 不允许（报 "Host sync in CUDA graph capture"）。block_ids 范围由调用方
+    # （fixbuf / moe_tp 的 block_id 计算）保证，capture 时省略校验。
+    if block_ids is not None and block_ids.numel() > 0 \
+            and not torch.cuda.is_current_stream_capturing():
+        assert block_ids.max().item() <= NUM_BLOCKS, \
+            f"block_id 越界: max {block_ids.max().item()} > NUM_BLOCKS ({NUM_BLOCKS})"
+        assert block_ids.min().item() >= 0, \
+            f"block_id 越界: min {block_ids.min().item()} < 0"
 
     pos = torch.empty(NK, dtype=torch.int64, device=x_flat.device)
     keep = torch.empty(NK, dtype=torch.int32, device=x_flat.device)
 
     grid = (NK,)
     moe_align_kernel[grid](
-        x_flat, w_flat, is_local, local_exp,
+        x_flat, w_flat, valid_mask, block_ids,
         pos, keep, cnt,
         x_align, w_align,
-        E_LOCAL=E_LOCAL, CAP=CAP, D=D, BLOCK_D=BLOCK_D,
+        NUM_BLOCKS=NUM_BLOCKS, CAP=CAP, D=D, BLOCK_D=BLOCK_D,
         num_warps=num_warps, num_stages=num_stages,
     )
     return pos, keep

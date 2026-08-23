@@ -11,7 +11,7 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 
 def _remap_expert_weight(weight_name: str, ep_size: int, ep_rank: int,
-                         num_experts: int) -> tuple[str | None, int | None]:
+                         num_experts: int, moe_mode: str = "ep") -> tuple[str | None, int | None]:
     """Remap expert weight name for EP filtering with stacked parameters.
 
     In EP mode, each rank only loads a subset of experts.  The HF checkpoint
@@ -25,6 +25,10 @@ def _remap_expert_weight(weight_name: str, ep_size: int, ep_rank: int,
         ep_size: expert parallel size.
         ep_rank: rank within the EP group.
         num_experts: total number of experts in the model.
+        moe_mode: "ep"（默认）→ 按 owner 过滤专家；"tp" → 不跳过专家，映射
+            stacked_*_tp，M 维 narrow 份数 = EP（= DP×TP），切片索引 = rank
+            在 EP group 内位置。tp + ep_size==1 走下方既有逻辑（个体专家、
+            全量加载）。
 
     Returns:
         ``(param_name, expert_id)`` if the expert belongs to this rank,
@@ -36,6 +40,21 @@ def _remap_expert_weight(weight_name: str, ep_size: int, ep_rank: int,
         return weight_name, None  # Not an expert weight, load as-is.
 
     expert_id = int(m.group(1))
+
+    if moe_mode == "tp" and ep_size > 1:
+        # tp 模式：全专家本地持有，不按 owner 过滤；权重沿 M 维切 EP 份，
+        # 切片由 param 的 weight_loader（M 维 narrow，切片索引 = ep_rank）完成。
+        # expert_id 保持全局 id（0..num_experts-1），对应 stacked_*_tp 的行号。
+        if 'gate_proj' in weight_name:
+            new_name = re.sub(r'experts\.\d+\.gate_proj\.weight', 'stacked_gate_tp', weight_name)
+        elif 'up_proj' in weight_name:
+            new_name = re.sub(r'experts\.\d+\.up_proj\.weight', 'stacked_up_tp', weight_name)
+        elif 'down_proj' in weight_name:
+            new_name = re.sub(r'experts\.\d+\.down_proj\.weight', 'stacked_down_tp', weight_name)
+        else:
+            return weight_name, None
+        return new_name, expert_id
+
     experts_per_rank = num_experts // ep_size
     local_id = expert_id % experts_per_rank
     owner_rank = expert_id // experts_per_rank
@@ -66,7 +85,8 @@ def _remap_expert_weight(weight_name: str, ep_size: int, ep_rank: int,
 
 def load_model(model: nn.Module, path: str,
                ep_size: int = 1, ep_rank: int = 0,
-               num_experts: int | None = None):
+               num_experts: int | None = None,
+               moe_mode: str = "ep"):
     """Load model weights from safetensors with optional EP filtering.
 
     Args:
@@ -76,6 +96,8 @@ def load_model(model: nn.Module, path: str,
         ep_rank: rank within the EP group.
         num_experts: total number of experts (needed for EP remapping).
                      If None, no EP filtering is applied.
+        moe_mode: "ep"（默认）→ 专家按 owner 过滤；"tp" → 映射 stacked_*_tp
+                  并沿 M 维切片（详见 _remap_expert_weight）。
     """
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     for file in glob(os.path.join(path, "*.safetensors")):
@@ -89,7 +111,7 @@ def load_model(model: nn.Module, path: str,
                 expert_id = None
                 if num_experts is not None and ep_size > 1:
                     param_name, expert_id = _remap_expert_weight(
-                        hf_name, ep_size, ep_rank, num_experts
+                        hf_name, ep_size, ep_rank, num_experts, moe_mode
                     )
                     if param_name is None:
                         continue  # Skip expert belonging to another rank
