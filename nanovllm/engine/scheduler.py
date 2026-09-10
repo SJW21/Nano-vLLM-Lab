@@ -2,7 +2,7 @@ from collections import deque
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
-from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.block_manager import BlockManager, HybridBlockManager
 
 
 class Scheduler:
@@ -12,7 +12,8 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        ManagerClass = HybridBlockManager if config.hybrid_model else BlockManager
+        self.block_manager = ManagerClass(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -85,6 +86,8 @@ class Scheduler:
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
+            elif is_prefill:
+                self.block_manager.hash_state(seq)
             seq.append_token(token_id)
             # [BUGFIX] CUDA Graph Buffer max size is set to "max_tokens" not "prompt_len + completed_len"
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:

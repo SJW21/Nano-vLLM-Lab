@@ -1,12 +1,14 @@
 from collections import deque
 import xxhash
 import numpy as np
+import torch
+from nanovllm.engine.sequence import SequenceStatus
 
 from nanovllm.engine.sequence import Sequence
+from nanovllm.config import Config
 
 
 class Block:
-
     def __init__(self, block_id):
         self.block_id = block_id
         self.ref_count = 0
@@ -21,6 +23,23 @@ class Block:
         self.ref_count = 1
         self.hash = -1
         self.token_ids = []
+
+
+class LinearState:
+    def __init__(self, state_id):
+        self.state_id = state_id
+        self.ref_count = 0
+        self.hash = -1
+        self.token_ids = []
+
+    def update(self, hash: int, token_ids: list[int]):
+        self.hash = hash
+        self.token_ids = token_ids
+
+    def reset(self):
+        self.ref_count = 1
+        self.hash = -1
+        self.token_ids = []   
 
 
 class BlockManager:
@@ -118,3 +137,213 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+
+
+class HybridBlockManager(BlockManager):
+    # hybrid Attention Manager: Linear (mamba state) + Full
+    def __init__(self, num_blocks, block_size, num_states):
+        super().__init__(num_blocks, block_size)
+        self.states: list[LinearState] = [LinearState(i) for i in range(num_states)]
+        self.free_state_ids: deque[int] = deque(range(num_states))
+        self.used_state_ids: set[int] = set()
+        self.hash_table = {
+            "full": self.hash_to_block_id,
+            "linear": dict()
+        }
+
+    def _allocate_state(self) -> int:
+        state_id = self.free_state_ids.popleft()
+        state = self.blocks[state_id]
+        assert state.ref_count == 0
+        if state.hash != -1 and self.hash_table['linear'].get(state.hash) == state_id:
+            del self.hash_table['linear'][state.hash]
+        state.reset()
+        self.used_state_ids.add(state_id)
+        return state_id
+
+    def _deallocate_state(self, state_id: int):
+        assert self.states[state_id].ref_count == 0
+        self.used_state_ids.remove(state_id)
+        self.free_state_ids.append(state_id)
+
+    def can_allocate(self, seq: Sequence) -> int:
+        # Judge block/state is enough & find the cached blocks(state)
+        h = -1
+        num_cached_blocks = 0
+        num_new_blocks = seq.num_blocks
+        final_cached_blocks = 0
+        final_new_blocks = 0
+        # step 1: cached full attn (full is always the first)
+        for i in range(seq.num_blocks - 1):
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h)
+            block_id = self.hash_table['full'].get(h, -1)
+            state_id = self.hash_table['linear'].get(h, -1)
+            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                break
+            num_cached_blocks += 1
+            if block_id in self.used_block_ids:
+                num_new_blocks -= 1
+            if state_id != -1 and self.states[state_id].token_ids == token_ids:
+                final_cached_blocks = num_cached_blocks
+                final_new_blocks = num_new_blocks
+            
+        if len(self.free_block_ids) < final_new_blocks or \
+            len(self.free_state_ids) < 1:
+            return -1
+        return final_cached_blocks
+
+    def allocate(self, seq: Sequence, num_cached_blocks: int):
+        assert not seq.block_table
+        assert seq.cached_state == -1 and seq.mamba_state == -1
+
+        def revive_and_count_increase(id: int, is_full: bool):           
+            data = self.blocks[id] if is_full else self.states[id]
+            used_list = self.used_block_ids \
+                if is_full else self.used_state_ids
+            if id in used_list:
+                data.ref_count += 1
+            else:
+                if is_full:
+                    self.free_block_ids.remove(id)
+                    self.used_block_ids.add(id)
+                else:
+                    self.free_state_ids.remove(id)
+                    self.used_state_ids.add(id)                   
+
+        h = -1
+        for i in range(num_cached_blocks):
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h)
+            # full
+            block_id = self.hash_table['full'][h]
+            revive_and_count_increase(block_id, True)
+            seq.block_table.append(block_id)
+            # linear
+            state_id = self.hash_table['linear'][h]
+            revive_and_count_increase(state_id, False)
+            seq.cached_state = state_id
+
+        for i in range(num_cached_blocks, seq.num_blocks):
+            seq.block_table.append(self._allocate_block())
+        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        # new linear state buffer
+        seq.mamba_state = self._allocate_state()
+
+    def reckoning(self, id, is_full: bool):
+        data = self.blocks[id] if is_full else self.states[id]
+        data.ref_count -= 1
+        if data.ref_count == 0:
+            if is_full:
+                self._deallocate_block(id)
+            else:
+                self._deallocate_state(id)
+
+    def deallocate(self, seq: Sequence):
+        # when req finished or preempted
+        for block_id in reversed(seq.block_table):
+            self.reckoning(block_id, True)
+        seq.num_cached_tokens = 0
+        seq.block_table.clear()
+        # linear state
+        if seq.cached_state != -1:
+            self.reckoning(seq.cached_state, False)
+        if seq.status == SequenceStatus.FINISHED:
+            self.hash_state(seq, finished=True)
+        self.reckoning(seq.mamba_state, False)
+        seq.refresh_linear_state()
+
+    def hash_state(self, seq: Sequence, finished: bool = False):
+        '''Principles
+        a. update state hash table after prefill or req-finished;
+        b. update state hash table only when free states are enough;
+        c. release cached state first if has;
+        d. different from full block cache, release state after caching.
+        '''
+        if seq.cached_state != -1:
+            self.reckoning(seq.cached_state, False)
+            seq.cached_state = -1
+
+        # return directly if not enough state slots
+        min_line = 1 if finished else 2
+        if len(self.free_state_ids) < min_line:
+            return
+        
+        tip = seq.num_cached_tokens // self.block_size 
+        h = self.blocks[seq.block_table[tip-1]].hash
+        state = self.states[seq.mamba_state]
+        token_ids = seq.block(tip-1)
+        state.update(h, token_ids)
+        self.hash_table['linear'][h] = state.state_id
+
+        # free and allocate new state
+        if not finished:
+            self.reckoning(seq.mamba_state, False)
+            seq.mamba_state = self._allocate_state()
+        
+
+class MambaShape:
+    def __init__(self, config: Config):
+        hf_conf = config.hf_config
+        tp_size = config.tensor_parallel_size
+        self.nhead_k = hf_conf.linear_num_key_heads
+        self.nhead_v = hf_conf.linear_num_value_heads
+        self.k_dim = hf_conf.linear_key_head_dim
+        self.v_dim = hf_conf.linear_value_head_dim
+        self.conv_kernel_size = hf_conf.linear_conv_kernel_dim
+
+        # shape check
+        assert self.nhead_k % tp_size == 0, f"linear num key heads {self.nhead_k} \
+            cannot be sharded by tp_size {tp_size}"
+        assert self.nhead_v % tp_size == 0, f"linear num query heads {self.nhead_v} \
+            cannot be sharded by tp_size {tp_size}"
+        k_dim_all = self.nhead_k * self.k_dim
+        v_dim_all = self.nhead_v * self.v_dim
+
+        # conv state
+        conv_dim = v_dim_all + 2 * k_dim_all
+        self.conv_state_shape = conv_dim // tp_size, self.conv_kernel_size - 1
+        # temporal state
+        self.temporal_state_shape = self.nhead_v // tp_size, self.v_dim, self.k_dim
+
+        # dtype setting
+        dtype_map = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }
+        dtype_size = {
+            torch.float32: 4,
+            torch.bfloat16: 2,
+            torch.float16: 2,
+        }
+        self.conv_dtype = torch.bfloat16
+        self.ssm_dtype = dtype_map[hf_conf.mamba_ssm_dtype]
+
+        self.conv_bytes = self.conv_state_shape[0] * self.conv_state_shape[1] * dtype_size[self.conv_dtype]
+        self.tempotal_bytes = self.temporal_state_shape[0] * self.v_dim * self.k_dim * dtype_size[self.ssm_dtype]
+
+
+class MambaPool:
+    def __init__(self,
+                 config: Config,
+                 mem_size: int,
+                 num_layers: int,
+                 device: torch.device
+                 ):
+        # [TODO] Support Multi-Type Conv shape, for example, KDA
+        shape_param = MambaShape(config)
+        state_bytes = num_layers * (shape_param.conv_bytes + shape_param.tempotal_bytes)
+        size = mem_size // state_bytes
+        
+        self.conv_state = torch.zeros(
+                        size=(num_layers, size + 1) + shape_param.conv_state_shape,
+                        dtype=shape_param.conv_dtype,
+                        device=device,
+                    )
+        
+        self.temporal_state = torch.zeros(
+                    size=(num_layers, size + 1) + shape_param.temporal_state_shape,
+                    dtype=shape_param.ssm_dtype,
+                    device=device,
+                )

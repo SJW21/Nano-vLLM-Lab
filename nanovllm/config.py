@@ -2,6 +2,10 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+hybrid_model_list = {
+    "Qwen3_5ForConditionalGeneration"
+}
+
 
 @dataclass(slots=True)
 class Config:
@@ -23,6 +27,7 @@ class Config:
     profiler_output: str = "./profiler_logs"
     profiler_warmup_steps: int = 3 # skip num_steps before profile 
     profiler_active_steps: int = 0 # num_steps to profile
+    linear_cache_ratio: float = 0.2 # default ratio of linear_cache
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -32,3 +37,9 @@ class Config:
         assert 1 <= self.data_parallel_size * self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        self.hybrid_model = any(a in hybrid_model_list for a in self.hf_config.architectures)
+        if self.hybrid_model:
+            self.num_linear_layers = self.hf_config.layer_types.count('linear_attention')
+            self.num_full_layers = self.hf_config.num_hidden_layers - self.num_linear_layers
+        else:
+            self.num_full_layers, self.num_linear_layers = self.hf_config.num_hidden_layers, 0
