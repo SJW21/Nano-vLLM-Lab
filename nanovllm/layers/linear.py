@@ -104,27 +104,33 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int | None = None,
         bias: bool = False,
+        attn_output_gate: bool = False,
     ):
         tp_size = get_tp_group().world_size
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
         self.num_heads = divide(total_num_heads, tp_size)
         self.num_kv_heads = divide(total_num_kv_heads, tp_size)
-        output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
+        # with an output gate each head carries head_size query dims *and*
+        # head_size gate dims, both inside the checkpoint's q_proj
+        self.attn_output_gate = attn_output_gate
+        output_size = (total_num_heads * (1 + int(attn_output_gate))
+                       + 2 * total_num_kv_heads) * self.head_size
         super().__init__(hidden_size, output_size, bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
         assert loaded_shard_id in ["q", "k", "v"]
+        q_size = self.num_heads * self.head_size * (1 + int(self.attn_output_gate))
         if loaded_shard_id == "q":
-            shard_size = self.num_heads * self.head_size
+            shard_size = q_size
             shard_offset = 0
         elif loaded_shard_id == "k":
             shard_size = self.num_kv_heads * self.head_size
-            shard_offset = self.num_heads * self.head_size
+            shard_offset = q_size
         else:
             shard_size = self.num_kv_heads * self.head_size
-            shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
+            shard_offset = q_size + self.num_kv_heads * self.head_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)

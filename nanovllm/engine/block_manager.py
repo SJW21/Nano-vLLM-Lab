@@ -2,7 +2,6 @@ from collections import deque
 import xxhash
 import numpy as np
 import torch
-from nanovllm.engine.sequence import SequenceStatus
 
 from nanovllm.engine.sequence import Sequence
 from nanovllm.config import Config
@@ -138,11 +137,34 @@ class BlockManager:
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
 
+    def carry_state(self, seq: Sequence):
+        """Non-hybrid counterpart of ``HybridBlockManager.carry_state``."""
+        return None
+
+    def alloc_snapshot(self, seq: Sequence) -> int:
+        """No linear state, hence nothing to snapshot.
+
+        Returns the same "no slot" sentinel as the hybrid manager -- the scheduler
+        compares the result against 0, so this must be an int, not ``None``.
+        """
+        return -1
+
+    def register_snapshot(self, seq: Sequence):
+        """Non-hybrid counterpart of ``HybridBlockManager.register_snapshot``."""
+        return None
+
+    def release_read_slot(self, seq: Sequence):
+        """Non-hybrid counterpart of ``HybridBlockManager.release_read_slot``."""
+        return None
+
 
 class HybridBlockManager(BlockManager):
     # hybrid Attention Manager: Linear (mamba state) + Full
     def __init__(self, num_blocks, block_size, num_states):
         super().__init__(num_blocks, block_size)
+        # state ids index MambaPool rows directly, so this count must equal the
+        # pool's slot count (ModelRunner writes it into config.num_linear_states)
+        assert num_states > 0, "linear state pool is empty; did allocate_kv_cache run?"
         self.states: list[LinearState] = [LinearState(i) for i in range(num_states)]
         self.free_state_ids: deque[int] = deque(range(num_states))
         self.used_state_ids: set[int] = set()
@@ -153,7 +175,7 @@ class HybridBlockManager(BlockManager):
 
     def _allocate_state(self) -> int:
         state_id = self.free_state_ids.popleft()
-        state = self.blocks[state_id]
+        state = self.states[state_id]
         assert state.ref_count == 0
         if state.hash != -1 and self.hash_table['linear'].get(state.hash) == state_id:
             del self.hash_table['linear'][state.hash]
@@ -204,12 +226,14 @@ class HybridBlockManager(BlockManager):
             if id in used_list:
                 data.ref_count += 1
             else:
+                # reviving an entry that was released but never overwritten
+                data.ref_count = 1
                 if is_full:
                     self.free_block_ids.remove(id)
                     self.used_block_ids.add(id)
                 else:
                     self.free_state_ids.remove(id)
-                    self.used_state_ids.add(id)                   
+                    self.used_state_ids.add(id)
 
         h = -1
         for i in range(num_cached_blocks):
@@ -219,10 +243,15 @@ class HybridBlockManager(BlockManager):
             block_id = self.hash_table['full'][h]
             revive_and_count_increase(block_id, True)
             seq.block_table.append(block_id)
-            # linear
-            state_id = self.hash_table['linear'][h]
-            revive_and_count_increase(state_id, False)
-            seq.cached_state = state_id
+            # linear: only the *frontier* block holds the state we resume from
+            # (can_allocate proved it matches there), and that one state covers
+            # every token before it. Reviving the entries of the blocks behind it
+            # would only leak references -- nothing ever reads them.
+            if i == num_cached_blocks - 1:
+                state_id = self.hash_table['linear'].get(h, -1)
+                if state_id != -1 and self.states[state_id].token_ids == token_ids:
+                    revive_and_count_increase(state_id, False)
+                    seq.cached_state = state_id
 
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
@@ -239,6 +268,57 @@ class HybridBlockManager(BlockManager):
             else:
                 self._deallocate_state(id)
 
+    def release_read_slot(self, seq: Sequence):
+        """Drop the read-in slot of a sequence (idempotent).
+
+        ``cached_state`` may alias ``mamba_state`` while a chunked prefill is in
+        flight; that slot is the sequence's working state and must not be
+        released here.
+        """
+        if seq.cached_state != -1 and seq.cached_state != seq.mamba_state:
+            self.reckoning(seq.cached_state, False)
+        seq.cached_state = -1
+
+    def carry_state(self, seq: Sequence):
+        """Chunked prefill continuation: the next chunk re-reads what this chunk
+        wrote, so the working slot becomes both source and target."""
+        self.release_read_slot(seq)
+        seq.cached_state = seq.mamba_state
+
+    def alloc_snapshot(self, seq: Sequence):
+        """Reserve the slot this step's forward will write a state snapshot into.
+
+        The scheduler calls this *before* the step, so that every rank learns the
+        destination from the sequence itself (no extra message, no copy channel).
+        The slot stays held (ref_count 1) until ``register_snapshot`` hands it to
+        the hash table, so nothing else can claim it in between.
+        """
+        seq.snapshot_state = self._allocate_state() if self.free_state_ids else -1
+        return seq.snapshot_state
+
+    def register_snapshot(self, seq: Sequence):
+        """Turn the slot the forward just wrote into a prefix-cache entry.
+
+        Must run after ``hash_blocks`` (the entry's key comes from the block the
+        snapshot sits on) and after ``num_cached_tokens`` was advanced. The slot is
+        released right away -- like a block, the hash entry keeps it revivable
+        until it is handed to other tokens.
+        """
+        slot, pos = seq.snapshot_state, seq.snapshot_pos
+        seq.snapshot_state, seq.snapshot_pos = -1, -1
+        if slot < 0:
+            return
+        # state and KV must cover exactly the same prefix, so a snapshot is only
+        # meaningful on a *complete* block boundary
+        if pos <= 0 or pos > seq.num_cached_tokens or pos % self.block_size:
+            self.reckoning(slot, False)
+            return
+        block = self.blocks[seq.block_table[pos // self.block_size - 1]]
+        state = self.states[slot]
+        state.update(block.hash, block.token_ids)
+        self.hash_table['linear'][block.hash] = slot
+        self.reckoning(slot, False)
+
     def deallocate(self, seq: Sequence):
         # when req finished or preempted
         for block_id in reversed(seq.block_table):
@@ -246,45 +326,18 @@ class HybridBlockManager(BlockManager):
         seq.num_cached_tokens = 0
         seq.block_table.clear()
         # linear state
-        if seq.cached_state != -1:
-            self.reckoning(seq.cached_state, False)
-        if seq.status == SequenceStatus.FINISHED:
-            self.hash_state(seq, finished=True)
+        if seq.snapshot_state != -1:
+            # reserved but never registered (preempted / aborted mid-step)
+            self.reckoning(seq.snapshot_state, False)
+            seq.snapshot_state = -1
+        self.release_read_slot(seq)
         self.reckoning(seq.mamba_state, False)
         seq.refresh_linear_state()
 
-    def hash_state(self, seq: Sequence, finished: bool = False):
-        '''Principles
-        a. update state hash table after prefill or req-finished;
-        b. update state hash table only when free states are enough;
-        c. release cached state first if has;
-        d. different from full block cache, release state after caching.
-        '''
-        if seq.cached_state != -1:
-            self.reckoning(seq.cached_state, False)
-            seq.cached_state = -1
-
-        # return directly if not enough state slots
-        min_line = 1 if finished else 2
-        if len(self.free_state_ids) < min_line:
-            return
-        
-        tip = seq.num_cached_tokens // self.block_size 
-        h = self.blocks[seq.block_table[tip-1]].hash
-        state = self.states[seq.mamba_state]
-        token_ids = seq.block(tip-1)
-        state.update(h, token_ids)
-        self.hash_table['linear'][h] = state.state_id
-
-        # free and allocate new state
-        if not finished:
-            self.reckoning(seq.mamba_state, False)
-            seq.mamba_state = self._allocate_state()
-        
 
 class MambaShape:
     def __init__(self, config: Config):
-        hf_conf = config.hf_config
+        hf_conf = config.text_config   # linear_* live on the text half (see Config)
         tp_size = config.tensor_parallel_size
         self.nhead_k = hf_conf.linear_num_key_heads
         self.nhead_v = hf_conf.linear_num_value_heads
@@ -318,7 +371,9 @@ class MambaShape:
             torch.float16: 2,
         }
         self.conv_dtype = torch.bfloat16
-        self.ssm_dtype = dtype_map[hf_conf.mamba_ssm_dtype]
+        # Qwen3.5's config has no mamba_ssm_dtype (that field belongs to the Mamba
+        # family); the GDN kernels are written for fp32 state throughout
+        self.ssm_dtype = dtype_map[getattr(hf_conf, "mamba_ssm_dtype", "float32")]
 
         self.conv_bytes = self.conv_state_shape[0] * self.conv_state_shape[1] * dtype_size[self.conv_dtype]
         self.tempotal_bytes = self.temporal_state_shape[0] * self.v_dim * self.k_dim * dtype_size[self.ssm_dtype]
@@ -335,15 +390,21 @@ class MambaPool:
         shape_param = MambaShape(config)
         state_bytes = num_layers * (shape_param.conv_bytes + shape_param.tempotal_bytes)
         size = mem_size // state_bytes
-        
+
+        # A state slot is one row of both tensors (all layers), and its row index
+        # *is* the id the kernels see: padding uses the -1 sentinel and every
+        # kernel guards it, so no slot needs to be kept in reserve.
+        assert size > 0, f"linear cache holds no state: {mem_size} < {state_bytes}"
+        self.num_slots = size
+
         self.conv_state = torch.zeros(
-                        size=(num_layers, size + 1) + shape_param.conv_state_shape,
+                        size=(num_layers, size) + shape_param.conv_state_shape,
                         dtype=shape_param.conv_dtype,
                         device=device,
                     )
-        
+
         self.temporal_state = torch.zeros(
-                    size=(num_layers, size + 1) + shape_param.temporal_state_shape,
+                    size=(num_layers, size) + shape_param.temporal_state_shape,
                     dtype=shape_param.ssm_dtype,
                     device=device,
                 )

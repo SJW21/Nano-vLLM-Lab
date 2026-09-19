@@ -19,8 +19,14 @@ class ModelRunner:
 
     def __init__(self, config: Config, rank: int, tar_rank: int, event: Event | list[Event]):
         self.config = config
-        hf_config = config.hf_config
+        # text half of the checkpoint: for Qwen3.5 VL configs the text fields
+        # (dtype, hidden_size, ...) live under text_config, not at the top level
+        hf_config = config.text_config
         self.block_size = config.kvcache_block_size
+        # every rank computes slot_mapping from Sequence.num_blocks / last_block_num_tokens,
+        # and spawn'ed workers only ever see the class default (LLMEngine sets it in the
+        # parent process, which does not survive the spawn) -- so set it per rank here
+        Sequence.block_size = self.block_size
         self.enforce_eager = config.enforce_eager
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.data_parallel_size
@@ -29,6 +35,7 @@ class ModelRunner:
         self.target_rank = tar_rank
         self.event = event
         self.is_hybrid = config.hybrid_model
+        self.mamba_pool = None
 
         init_distributed_environment(self.world_size, self.rank, backend="nccl")
         initialize_model_parallel(self.world_size, tensor_parallel_size=self.tp_size,
@@ -120,7 +127,7 @@ class ModelRunner:
 
     def allocate_kv_cache(self):
         config = self.config
-        hf_config = config.hf_config
+        hf_config = config.text_config
         full_ratio = 1. - config.linear_cache_ratio if self.is_hybrid else 1.
         free, total = torch.cuda.mem_get_info()
         used = total - free
@@ -137,8 +144,12 @@ class ModelRunner:
         # linear state cache init
         if self.is_hybrid:
             from nanovllm.engine.block_manager import MambaPool
-            mamba_pool = MambaPool(config, int(avaliable_mem*config.linear_cache_ratio), 
-                                   config.num_linear_layers, self.kv_cache.device)
+            self.mamba_pool = MambaPool(config, int(avaliable_mem*config.linear_cache_ratio),
+                                        config.num_linear_layers, self.kv_cache.device)
+            mamba_pool = self.mamba_pool
+            # state ids index pool rows directly: hand the slot count to the
+            # scheduler (built after this runner in both engines)
+            config.num_linear_states = mamba_pool.num_slots
 
         li_layer_id = kv_layer_id = 0
         for layer in self.model.layers:
@@ -174,6 +185,9 @@ class ModelRunner:
         block_tables = None
         state_ids = [] if self.is_hybrid else None
         cached_states = [] if self.is_hybrid else None
+        snapshot_ids = [] if self.is_hybrid else None
+        snapshot_pos = [] if self.is_hybrid else None
+        has_snapshot = False
         for seq in seqs:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
@@ -181,7 +195,8 @@ class ModelRunner:
             seqlen_k = end
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            bos = cu_seqlens_q[-1]      # this sequence's first index in the flat batch
+            cu_seqlens_q.append(bos + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
@@ -201,6 +216,18 @@ class ModelRunner:
             if self.is_hybrid:
                 state_ids.append(seq.mamba_state)
                 cached_states.append(seq.cached_state)
+                if seq.snapshot_state >= 0:
+                    # where the snapshot sits, as an index into the flattened batch
+                    # (bos, not cu_seqlens_q[-1]: that is this sequence's *end*)
+                    flat = bos + (seq.snapshot_pos - start)
+                    assert bos <= flat <= bos + seqlen_q, \
+                        f"snapshot position {flat} left sequence [{bos}, {bos + seqlen_q})"
+                    snapshot_ids.append(seq.snapshot_state)
+                    snapshot_pos.append(flat)
+                    has_snapshot = True
+                else:
+                    snapshot_ids.append(-1)
+                    snapshot_pos.append(-1)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -211,8 +238,10 @@ class ModelRunner:
         if self.is_hybrid:
             state_ids = torch.tensor(state_ids, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
             cached_states = torch.tensor(cached_states, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, 
-                    state_ids, cached_states)
+            snapshot_ids = torch.tensor(snapshot_ids, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            snapshot_pos = torch.tensor(snapshot_pos, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables,
+                    state_ids, cached_states, snapshot_ids, snapshot_pos, has_snapshot)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -221,6 +250,8 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         state_ids = [] if self.is_hybrid else None
+        snapshot_ids = [] if self.is_hybrid else None
+        has_snapshot = False
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
@@ -228,6 +259,10 @@ class ModelRunner:
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
             if self.is_hybrid:
                 state_ids.append(seq.mamba_state)
+                # a decode snapshot is a copy of the working slot after this step,
+                # so it needs no position (only ever set when the scheduler opted in)
+                snapshot_ids.append(seq.snapshot_state)
+                has_snapshot = has_snapshot or seq.snapshot_state >= 0
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -235,8 +270,9 @@ class ModelRunner:
         block_tables = self.prepare_block_tables(seqs)
         if self.is_hybrid:
             state_ids = torch.tensor(state_ids, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, 
-                    state_ids=state_ids)
+            snapshot_ids = torch.tensor(snapshot_ids, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+                    state_ids=state_ids, snapshot_ids=snapshot_ids, has_snapshot=has_snapshot)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -280,7 +316,7 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
-        hf_config = config.hf_config
+        hf_config = config.text_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)

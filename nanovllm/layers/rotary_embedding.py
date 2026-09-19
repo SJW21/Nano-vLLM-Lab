@@ -7,11 +7,26 @@ def apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    rotary_dim: int | None = None,
 ) -> torch.Tensor:
-    x1, x2 = torch.chunk(x.float(), 2, dim=-1)
+    """Rotate the first ``rotary_dim`` dims of each head, pass the tail through.
+
+    ``rotary_dim`` defaults to the whole head. It is smaller when the model uses a
+    partial rotary factor (Qwen3.5 rotates 25% of the head): the cos/sin table is
+    built from that many dims, and the remaining dims ride along untouched --
+    same layout as transformers' ``apply_rotary_pos_emb``.
+    """
+    if rotary_dim is None or rotary_dim == x.shape[-1]:
+        x_rot, x_pass = x.float(), None
+    else:
+        x_rot, x_pass = x.float()[..., :rotary_dim], x[..., rotary_dim:]
+    x1, x2 = torch.chunk(x_rot, 2, dim=-1)
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
-    return torch.cat((y1, y2), dim=-1).to(x.dtype)
+    out = torch.cat((y1, y2), dim=-1)
+    if x_pass is not None:
+        out = torch.cat((out, x_pass), dim=-1)
+    return out.to(x.dtype)
 
 
 class RotaryEmbedding(nn.Module):
@@ -25,7 +40,9 @@ class RotaryEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.head_size = head_size
-        assert rotary_dim == head_size
+        assert 0 < rotary_dim <= head_size, "rotary_dim must fit inside the head"
+        assert rotary_dim % 2 == 0, "rotary_dim must be even (pairs are rotated)"
+        self.rotary_dim = rotary_dim
         inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
@@ -43,8 +60,8 @@ class RotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
-        query = apply_rotary_emb(query, cos, sin)
-        key = apply_rotary_emb(key, cos, sin)
+        query = apply_rotary_emb(query, cos, sin, self.rotary_dim)
+        key = apply_rotary_emb(key, cos, sin, self.rotary_dim)
         return query, key
 
 

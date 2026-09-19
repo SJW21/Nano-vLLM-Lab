@@ -25,6 +25,8 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
+        rotary_dim: int | None = None,
+        attn_output_gate: bool = False,
     ) -> None:
         super().__init__()
         tp_size = get_tp_group().world_size
@@ -39,6 +41,9 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
+        # Qwen3.5 folds a per-head output gate into q_proj (2*head_dim per head:
+        # first half query, second half gate) and rotates only part of each head
+        self.attn_output_gate = attn_output_gate
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -46,6 +51,7 @@ class Qwen3Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
+            attn_output_gate=attn_output_gate,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -56,7 +62,7 @@ class Qwen3Attention(nn.Module):
             rope_theta = rope_scaling.get("rope_theta", rope_theta)
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
+            rotary_dim=rotary_dim or self.head_dim,
             max_position=max_position,
             base=rope_theta,
         )
