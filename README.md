@@ -38,6 +38,8 @@ pip install modelscope
 python -c "
 from modelscope import snapshot_download
 snapshot_download('Qwen/Qwen3-0.6B', cache_dir='./huggingface/Qwen3-0.6B/')
+snapshot_download('Qwen/Qwen3.5-0.8B', cache_dir='./huggingface/Qwen3.5-0.8B/')
+snapshot_download('Qwen/Qwen3-30B-A3B', cache_dir='./huggingface/Qwen3-30B-A3B/')
 "
 ```
 

@@ -50,21 +50,24 @@ class ModelRunner:
         # Model selection: MoE vs dense
         is_moe = hf_config.model_type == "qwen3_moe"
         if is_moe:
-            if config.moe_mode == "ep" and config.data_parallel_size == 1:
-                print("[ModelRunner] 提示：DP=1 时建议使用 moe_tp（AllReduce 后端，通信量更省；"
-                      "EP=4/K=8 时约为 moe_ep 的 1/4，见 moe_refactor_plan §3），不强制。")
             ep_size = config.expert_parallel_size
             ep_rank = rank if ep_size > 1 else 0  # EP covers all ranks
             self.model = Qwen3MoEForCausalLM(hf_config, ep_size, ep_rank,
                                                config.moe_mode)
-            load_model(self.model, config.model,
-                       ep_size=ep_size, ep_rank=ep_rank,
-                       num_experts=hf_config.num_experts,
-                       moe_mode=config.moe_mode)
+            load_model(self.model, config.model, num_experts=hf_config.num_experts)
         else:
             self.model = Qwen3ForCausalLM(hf_config)
             load_model(self.model, config.model)
         self.sampler = Sampler()
+        # graph 档位上界（capture 与 MoE buffer pool 容量共用同一份）
+        self.graph_max_bs = min(self.config.max_num_seqs, 512)
+        if is_moe:
+            # MoE 计算路径一次成型：拼装 MoEWeights（并释放 HF 布局源参数）、
+            # 建跨层共享的 graph buffer pool。必须在 warmup/capture 之前——
+            # warmup 的 eager prefill 同时完成两个 grouped GEMM kernel 的
+            # autotune 预热，capture 内不再触发 host sync。
+            self.model.finalize_moe(
+                max_tokens=max(self._graph_batch_sizes(self.graph_max_bs)))
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -232,7 +235,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_max_bs:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -260,11 +263,20 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    def _graph_batch_sizes(self, max_bs: int) -> list[int]:
+        """graph 档位列表（capture 与 MoE buffer pool 容量共用同一份）。
+
+        小 bs 细粒度，大 bs 按 16 步进；顶档 = ceil(max_bs/16)*16，允许略超
+        max_bs（capture 时 input_ids[:bs] 自动截断），保证任意 bs <= max_bs
+        都有档位可查。
+        """
+        return [1, 2, 4, 8] + list(range(16, max_bs + 16, 16))
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = self.graph_max_bs
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
@@ -272,19 +284,14 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        # 档位列表：小 bs 细粒度，大 bs 按 16 步进；顶档 = ceil(max_bs/16)*16，
-        # 允许略超 max_bs（capture 时 input_ids[:bs] 自动截断），保证任意 bs <= max_bs 都有档位可查。
-        base_bs = [1, 2, 4, 8] + list(range(16, max_bs + 16, 16))
-        if self.config.moe_mode == "ep" and self.tp_size > 1:
-            # RS 均匀性（R2）：moe_ep 的 RS[TP] 要求 N % TP == 0，档位 bs 对齐 TP 倍数。
-            # 不做 <= max_bs 过滤：对齐可能把末档推到 max_bs 之上，过滤会删掉它，
-            # 导致 bs ∈ (末档, max_bs] 无档位可查（run_model 中 StopIteration）。
-            base_bs = [((bs + self.tp_size - 1) // self.tp_size) * self.tp_size for bs in base_bs]
-            base_bs = sorted(set(base_bs))
-        self.graph_bs = base_bs
+        self.graph_bs = self._graph_batch_sizes(max_bs)
         self.graphs = {}
         self.graph_pool = None
 
+        # 注：每档 capture 前的 warmup（下面 outputs[:bs] = self.model(...)）
+        # 在 capture 外执行整模型 forward → MoE 走 staged 路径 → 两个 grouped
+        # GEMM kernel 的 autotune 与编译在 capture 之前完成，capture 内不再有
+        # host sync（autotune benchmark 含 events/同步，在 capture 内会 abort）。
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])

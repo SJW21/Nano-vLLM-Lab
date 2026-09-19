@@ -106,21 +106,6 @@ class GroupCoordinator:
             output_tensor = None
         return output_tensor
 
-    def all_to_all(self, input_: torch.Tensor,
-                   output_split_sizes: list[int] | None = None,
-                   input_split_sizes: list[int] | None = None) -> torch.Tensor:
-        world_size = self.world_size
-        if output_split_sizes is None:
-            output_split_sizes = [input_.size(0) // world_size] * world_size
-        if input_split_sizes is None:
-            input_split_sizes = [input_.size(0) // world_size] * world_size
-        output = torch.empty(sum(output_split_sizes), *input_.shape[1:],
-                             dtype=input_.dtype, device=input_.device)
-        dist.all_to_all_single(output, input_,
-                               output_split_sizes, input_split_sizes,
-                               group=self.device_group)
-        return output
-
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         if dim < 0:
@@ -128,15 +113,6 @@ class GroupCoordinator:
         gather_list = [torch.empty_like(input_) for _ in range(world_size)]
         dist.all_gather(gather_list, input_, group=self.device_group)
         return torch.cat(gather_list, dim=dim)
-
-    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        world_size = self.world_size
-        if dim < 0:
-            dim += input_.dim()
-        input_list = list(input_.chunk(world_size, dim=dim))
-        output = torch.empty_like(input_list[0])
-        dist.reduce_scatter(output, input_list, group=self.device_group)
-        return output
 
     def send(self, tensor: torch.Tensor, dst: int| None = None) -> None:
         raise NotImplementedError

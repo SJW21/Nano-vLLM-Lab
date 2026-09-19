@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 from nanovllm.distributed.parallel_state import get_tp_group
 
@@ -137,12 +136,8 @@ class RowParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
-        output_comm: str = "all_reduce",
     ):
-        assert output_comm in ("all_reduce", "reduce_scatter"), \
-            f"Invalid output_comm: {output_comm}"
         tp_size = get_tp_group().world_size
-        self.output_comm = output_comm
         super().__init__(divide(input_size, tp_size), output_size, bias, 1)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -158,9 +153,5 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            if self.output_comm == "reduce_scatter":
-                # RS 行块语义：rank r 持第 r 个 N/TP 块（§2.2 核心包装，通信量与 AR 等价）
-                y = get_tp_group().reduce_scatter(y, dim=0)
-            else:
-                get_tp_group().all_reduce(y)
+            get_tp_group().all_reduce(y)
         return y
