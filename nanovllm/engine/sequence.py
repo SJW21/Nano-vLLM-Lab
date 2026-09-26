@@ -47,15 +47,12 @@ class Sequence:
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
-        # slot holding the state that the next prefill computation reads from:
-        # a prefix-cache slot, or this sequence's own mamba_state while a chunked
-        # prefill is in flight (-1 => start from zero)
+        # slot the next prefill reads its state from: a prefix-cache slot, or this
+        # sequence's own mamba_state while a chunked prefill is in flight (-1 => zero)
         self.cached_state = -1
         self.mamba_state = -1 # this sequence's working linear state slot
-        # state snapshot for this step: the slot the forward writes the state at
-        # ``snapshot_pos`` into, and that position (both -1 => no snapshot). The
-        # scheduler picks them *before* the step so every rank writes the same
-        # slot -- the ids travel with the sequence, no copy channel needed.
+        # this step's snapshot target and position, picked by the scheduler before the
+        # step so every rank writes the same slot (both -1 => no snapshot)
         self.snapshot_state = -1
         self.snapshot_pos = -1
         self.temperature = sampling_params.temperature
@@ -75,10 +72,6 @@ class Sequence:
     @property
     def num_completion_tokens(self):
         return self.num_tokens - self.num_prompt_tokens
-
-    @property
-    def prompt_token_ids(self):
-        return self.token_ids[:self.num_prompt_tokens]
 
     @property
     def completion_token_ids(self):

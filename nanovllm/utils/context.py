@@ -1,7 +1,4 @@
-import os
-import sys
 import torch
-import contextlib
 from dataclasses import dataclass
 
 
@@ -17,15 +14,13 @@ class Context:
     block_tables: torch.Tensor | None = None
     state_ids: torch.Tensor | None = None
     cached_states: torch.Tensor | None = None
-    # linear-state snapshot of this step, one entry per sequence (like state_ids):
-    # the destination slot (-1 => none) and, for prefill, the token index in the
-    # flattened batch that slot takes its state from. ``has_snapshot`` is the host
-    # side gate -- probing the tensors would cost a device sync in every layer.
+    # this step's linear-state snapshot, one entry per sequence: the destination slot
+    # (-1 => none) and, for prefill, the flat-batch token index it takes state from.
+    # ``has_snapshot`` is the host gate -- probing the tensors would sync per layer.
     snapshot_ids: torch.Tensor | None = None
     snapshot_pos: torch.Tensor | None = None
     has_snapshot: bool = False
-    # chunked-KDA metadata for the GDN layers, filled lazily on the first
-    # linear-attention layer of a prefill step (see layers/gdn_ops.py)
+    # chunked-scan metadata for the GDN layers, filled on the first one of a prefill step
     chunk_indices: torch.Tensor | None = None
     chunk_offsets: torch.Tensor | None = None
 
@@ -43,28 +38,3 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
 def reset_context():
     global _CONTEXT
     _CONTEXT = Context()
-
-
-@contextlib.contextmanager
-def suppress_stdout():
-    """
-    Suppress stdout from C libraries at the file descriptor level.
-    """
-    # Don't suppress if logging level is DEBUG
-    if os.environ.get('VLLM_LOGGING_LEVEL', 'NORMAL') == "DEBUG":
-        yield
-        return
-    
-    stdout_fd = sys.stdout.fileno()
-    stdout_dup = os.dup(stdout_fd)
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-
-    try:
-        sys.stdout.flush()
-        os.dup2(devnull_fd, stdout_fd)
-        yield
-    finally:
-        sys.stdout.flush()
-        os.dup2(stdout_dup, stdout_fd)
-        os.close(stdout_dup)
-        os.close(devnull_fd)

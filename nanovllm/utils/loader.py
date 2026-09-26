@@ -4,12 +4,9 @@ import torch
 from torch import nn
 from safetensors import safe_open
 
-# Qwen3.5 VL checkpoints wrap the text tower in `model.language_model.` and ship two
-# modules this engine does not implement: the vision tower, and the multi-token
-# prediction head (`mtp.*`, a training-time auxiliary draft module that standard
-# autoregressive inference never executes). Both are skipped explicitly -- they have
-# no module here; everything else must resolve, otherwise the model would run with
-# uninitialised weights.
+# Two checkpoint modules have no counterpart here and are skipped explicitly: the vision
+# tower, and `mtp.*` (a training-time draft head that plain inference never executes).
+# Everything else must resolve -- an unloaded parameter means an uninitialised model.
 _IGNORED_PREFIXES = {
     "model.visual.": "vision-tower",
     "mtp.": "multi-token-prediction",
@@ -75,9 +72,8 @@ def load_model(model: nn.Module, path: str):
             print(f"[loader] skipped {len(names)} {reason} weight(s), "
                   f"e.g. {names[0]}")
     # tied parameters (lm_head sharing embed_tokens) never appear in the checkpoint.
-    # NOTE: this catches a parameter that received *nothing*; a fused parameter with
-    # one shard missing (checkpoint has q_proj and v_proj but no k_proj) counts as
-    # loaded -- those names resolve, so nothing above fires on them either.
+    # NOTE: this catches a parameter that received *nothing* -- a fused parameter missing
+    # only one shard (q_proj and v_proj present, k_proj absent) still counts as loaded.
     missing = [n for n in params if n not in loaded
                and not any(params[n].data_ptr() == params[m].data_ptr() for m in loaded)]
     if missing:

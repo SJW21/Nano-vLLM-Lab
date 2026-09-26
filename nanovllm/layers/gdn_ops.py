@@ -1,25 +1,11 @@
 """Triton kernels for Qwen3.5's Gated Delta Net (linear attention).
 
-Ported from vLLM 0.26.0's vendored flash-linear-attention kernels:
+Ported from vLLM 0.26.0's vendored flash-linear-attention kernels; the deliberate
+differences from upstream (no autotune, the dropped TMA/ROCm/prefix-caching branches, the
+re-implemented conv kernels) are recorded in Devlog/v0.3.1.md item 23.
 
-    vllm/third_party/flash_linear_attention/ops/{cumsum,chunk_scaled_dot_kkt,
-        solve_tril,wy_fast,chunk_delta_h,chunk_o,chunk,l2norm}.py
-    vllm/third_party/flash_linear_attention/ops/fused_recurrent.py  (packed decode)
-
-Differences from upstream (deliberate, see Devlog v0.3):
-
-* no autotune -- every kernel runs with one fixed, hand-picked config, so there is
-  no first-call tuning pass and no tuning-time memory spike;
-* TMA / ROCm / AMD / CUDA-graph special cases and the prefix-caching
-  block-alignment branch of ``causal_conv1d`` are dropped;
-* ``fused_recurrent_gated_delta_rule_packed_decode``'s "state slot 0 is the null
-  block" bail-out is dropped: nano-vllm's MambaPool hands out slot 0 as a legal
-  slot;
-* the conv kernels are re-implemented against the same layout contract instead of
-  being copied, because ~60% of upstream's 1239 lines serve APC/spec-decode.
-
-Layout conventions (identical to vLLM/FLA, which is what ``MambaShape`` in
-``nanovllm/engine/block_manager.py`` already assumes):
+Layout conventions, identical to vLLM/FLA -- and what ``MambaShape`` in
+``nanovllm/engine/block_manager.py`` assumes:
 
     q/k/v            [1, T, H, D]                (varlen: sequences packed along T)
     g / beta         [1, T, H]                   g is log-decay (<= 0)
@@ -27,9 +13,9 @@ Layout conventions (identical to vLLM/FLA, which is what ``MambaShape`` in
     conv             [num_slots, conv_dim, W-1]
     conv input       [T, conv_dim]
 
-Head layout follows GQA: ``H`` value heads share ``Hg`` key heads, value head
-``h`` uses key head ``h // (H // Hg)``. Kernels index that directly, so callers
-must *not* ``repeat_interleave`` q/k the way HF's reference implementation does.
+Head layout follows GQA: ``H`` value heads share ``Hg`` key heads, value head ``h`` uses
+key head ``h // (H // Hg)``. The kernels index that directly, so callers must *not*
+``repeat_interleave`` q/k the way HF's reference implementation does.
 """
 
 import torch
@@ -42,8 +28,8 @@ SOFTPLUS_THRESHOLD = 20.0
 
 
 # ---------------------------------------------------------------------------
-# index helpers -- built with tensor ops so the metadata stays on device; only
-# the grid size (a host int) forces one device->host read per prefill step
+# index helpers -- tensor ops, so only the grid size (a host int) forces one
+# device->host read per prefill step
 # ---------------------------------------------------------------------------
 def prepare_chunk_indices(cu_seqlens: torch.Tensor, chunk_size: int) -> torch.Tensor:
     """[NT, 2] int32 mapping global chunk slot -> (sequence, chunk within sequence)."""
@@ -99,12 +85,10 @@ def l2norm_fwd(x: torch.Tensor, eps: float = L2NORM_EPS) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# causal depthwise conv1d
+# causal depthwise conv1d over the packed [q, k, v] projection (silu applied)
 #
-# The conv consumes the packed [q, k, v] projection and applies silu. The state
-# slot holds the last (W-1) *raw* inputs, so a chunk that continues a sequence
-# reads its window back from the slot and overwrites it with the new tail -- the
-# same contract as ``nn.Conv1d`` with left padding, plus a persistent window.
+# A state slot holds the last W-1 *raw* inputs: ``nn.Conv1d`` with left padding,
+# plus a persistent window that a continuing chunk reads back and overwrites
 # ---------------------------------------------------------------------------
 @triton.jit(do_not_specialize=["T"])
 def _causal_conv1d_prefill_kernel(
@@ -155,11 +139,9 @@ def _causal_conv1d_prefill_kernel(
         )
         b_acc += b_x.to(tl.float32) * b_wj[None, :]
 
-    # The first chunk's program owns both the incoming window (taps that reach
-    # before the sequence start) and the write-back of the new window. Keeping
-    # them in one program means the slot is only touched read-then-write by one
-    # program, which rules out a cross-program race when in_idx == out_idx (a
-    # chunked-prefill continuation re-reads and overwrites its own slot).
+    # read and write-back of the window stay in one program (the first chunk's), which
+    # rules out a cross-program race when in_idx == out_idx -- a chunked-prefill
+    # continuation re-reads and overwrites its own slot
     if i_c == 0:
         if has_state:
             for j in tl.static_range(W - 1):
@@ -174,8 +156,7 @@ def _causal_conv1d_prefill_kernel(
                 )
                 b_acc += b_st.to(tl.float32) * b_wj[None, :]
 
-        # new window = trailing S raw inputs, or (for a sequence shorter than the
-        # window) the tail of the incoming window followed by what we did see
+        # new window = trailing S raw inputs (shorter sequences: what there is of them)
         slot_out = tl.load(out_idx + i_n).to(tl.int64)
         if slot_out >= 0:
             p_st_out = conv_states + slot_out * D * S
@@ -340,12 +321,9 @@ def causal_conv1d_update(
 
 
 # ---------------------------------------------------------------------------
-# prefill -- chunked gated delta rule
+# prefill -- chunked gated delta rule, mirroring vLLM's chunk_gated_delta_rule_fwd()
 #
 #   cumsum(g) -> A = kkt -> Ai = (I + A)^-1 -> (w, u) -> h/v_new -> o
-#
-# This mirrors vLLM's chunk_gated_delta_rule_fwd() kernel for kernel; the only
-# changes are the dropped autotune/TMA/ROCm branches and the fixed configs.
 # ---------------------------------------------------------------------------
 @triton.jit(do_not_specialize=["T"])
 def _chunk_local_cumsum_kernel(
@@ -1114,10 +1092,9 @@ def chunk_gated_delta_rule(
         raise ValueError("with cu_seqlens the batch dim must be 1 (sequences packed on T)")
     if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
         raise ValueError("initial_state must hold one state per sequence")
-    # The kernels take the head counts from different tensors, so a caller that
-    # swaps them would otherwise walk off the end of g/beta silently:
-    # H (value heads) comes from v/beta/g, Hg (key heads) from q/k, and the
-    # kernels index key head i_h // (H // Hg) -- a zero ratio makes that garbage.
+    # the kernels read the head counts off different tensors (H from v/beta/g, Hg from
+    # q/k) and index key head i_h // (H // Hg): swapped or non-multiple counts would walk
+    # off g/beta silently instead of failing
     assert q.shape[2] == k.shape[2], "q and k must share a key head count"
     assert beta.shape[-1] == g.shape[-1] == v.shape[-2], \
         "beta/g must be per value head ([*, H]) and match v"
@@ -1161,9 +1138,8 @@ def chunk_gated_delta_rule(
 # ---------------------------------------------------------------------------
 # decode -- one token per sequence, state updated in place
 #
-# Single kernel: gating (g = -exp(A_log) * softplus(a + dt_bias), beta = sigmoid(b)),
-# q/k l2norm and the delta-rule step are all fused, matching
-# fused_recurrent_gated_delta_rule_packed_decode in vLLM.
+# decode -- one kernel fusing the gating (g = -exp(A_log) * softplus(a + dt_bias),
+# beta = sigmoid(b)), the q/k l2norm and the delta-rule step
 # ---------------------------------------------------------------------------
 @triton.jit
 def _fused_recurrent_gdn_decode_kernel(

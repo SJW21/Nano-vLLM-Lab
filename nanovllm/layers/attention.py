@@ -77,68 +77,19 @@ class Attention(nn.Module):
 
 
 # ==== Linear Attn ====
+# The torch references below (`l2norm`, `torch_chunk_gated_delta_rule`, `torch_recurrent_gated_delta_rule`)
+# are on no engine path: they are the oracle `tests/test_gdn.py` checks the `gdn_ops.py` kernels against.
 def is_torchdynamo_exporting() -> bool:
     try:
         return torch.compiler.is_exporting()
-    except Exception:
+    except Exception:                       # torch < 2 has no torch.compiler
         return False
 
 
-def apply_mask_to_padding_states(hidden_states, attention_mask):
-    """
-    Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
-    """
-    # NOTE: attention mask is a 2D boolean tensor
-    if attention_mask is not None:
-        dtype = hidden_states.dtype
-        hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
-
-    return hidden_states
-
-
-# NOTE: the FLA package computes `x / torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)` instead, so if we align
-# with the GatedRMSNorm, maybe we can make that change as well.
 def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
-    """This function is intended to align with the l2norm implementation in the FLA library."""
+    # FLA's l2norm_fwd divides by sqrt(...) instead of multiplying by rsqrt
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return x * inv_norm
-
-
-def causal_conv1d_update(
-    hidden_states: torch.Tensor,
-    conv_state: torch.Tensor,
-    weight: nn.Parameter,
-    bias: nn.Parameter | None = None
-):
-    _, hidden_size, seq_len = hidden_states.shape
-    state_len = conv_state.shape[-1]
-
-    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
-    conv_state.copy_(hidden_states_new[:, :, -state_len:])
-    out = F.conv1d(hidden_states_new, weight.unsqueeze(1), bias, padding=0, groups=hidden_size)
-    out = out[:, :, -seq_len:]
-    out = nn.functional.silu(out)
-    return out.to(hidden_states.dtype)
-
-
-def causal_conv1d_fn(
-    hidden_states: torch.Tensor,
-    weight: nn.Parameter,
-    bias: nn.Parameter | None = None,
-    **kwargs,
-):
-    _, hidden_size, seq_len = hidden_states.shape
-    padding = weight.shape[-1] - 1
-
-    out = F.conv1d(
-        hidden_states.to(weight.dtype),
-        weight=weight.unsqueeze(1),
-        bias=bias,
-        padding=padding,
-        groups=hidden_size,
-    )[:, :, :seq_len]
-    out = nn.functional.silu(out)
-    return out.to(hidden_states.dtype)
 
 
 def torch_chunk_gated_delta_rule(
@@ -175,7 +126,7 @@ def torch_chunk_gated_delta_rule(
     num_v_heads, v_head_dim = value.shape[-2:]
     recurrent_state_shape = (batch_size, num_v_heads, k_head_dim, v_head_dim)
     padded_output_shape = (batch_size, num_v_heads, -1, v_head_dim)  # -1 is the padded sequence length
-    decay = g  # rename for clarity: argument name must stay "g" to match flash_linear_attention's API
+    decay = g  # the parameter name must stay "g" to match the FLA API
 
     # Make sure all tensors are fp32 and reshape them to [batch_size, num_*_heads, seqlen, ...]
     query, key, value, beta, decay = [
@@ -233,7 +184,7 @@ def torch_chunk_gated_delta_rule(
     # reading the old state (k_cumdecay). In the update, the part of new_values that the old state already predicts is
     # subtracted out, so that only the correction is written to the recurrent state: this is the delta rule.
 
-    # Not all export targets support the fast triangular solver, so we build the inverse by forward substitution then
+    # export targets without the fast triangular solver: invert by substitution instead
     if not is_torchdynamo_exporting():
         new_values = torch.linalg.solve_triangular(ut_system, v_beta, upper=False, unitriangular=True)
         k_cumdecay = torch.linalg.solve_triangular(ut_system, decayed_k_beta, upper=False, unitriangular=True)
@@ -294,7 +245,7 @@ def torch_recurrent_gated_delta_rule(
     initial_dtype = query.dtype
     batch_size, sequence_length, _, k_head_dim = key.shape
     num_v_heads, v_head_dim = value.shape[-2:]
-    decay = g  # rename for clarity: argument name must stay "g" to match flash_linear_attention's API
+    decay = g  # the parameter name must stay "g" to match the FLA API
 
     # Make sure all tensors are fp32 and reshape them to [batch_size, num_*_heads, seqlen, ...]
     query, key, value, beta, decay = [
