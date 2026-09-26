@@ -1,5 +1,6 @@
 import pickle
 import torch
+import torch._dynamo            # for reset(), see the device flip in __init__
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -12,7 +13,8 @@ from torch.profiler import record_function
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.profiler import Profiler
 from nanovllm.distributed.parallel_state import (init_distributed_environment,
-                                                 initialize_model_parallel)
+                                                 initialize_model_parallel,
+                                                 get_tp_group)
 
 
 class ModelRunner:
@@ -57,6 +59,12 @@ class ModelRunner:
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
+        # Everything compiled above was traced while "cuda" was the ambient default,
+        # and torch.compile guards every graph on torch.utils._device.CURRENT_DEVICE
+        # -- so those graphs are dead from here on ("torch._dynamo hit config.cache_size_limit"). 
+        # Drop them: the kernels they loaded stay alive for the graphs already captured, and the 
+        # serving paths recompile under the cpu default with the whole budget free.
+        torch._dynamo.reset()
         torch.set_default_dtype(default_dtype)
 
         if self.tp_size > 1:
@@ -137,6 +145,11 @@ class ModelRunner:
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * config.num_full_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         avaliable_mem = total * config.gpu_memory_utilization - used - peak + current
+        # sentinel: all tp ranks should have the same num of kv slots
+        if self.tp_size > 1:
+            budget = torch.tensor([int(avaliable_mem)], dtype=torch.int64, device="cuda")
+            dist.all_reduce(budget, op=dist.ReduceOp.MIN, group=get_tp_group().device_group)
+            avaliable_mem = float(budget.item())
         config.num_kvcache_blocks = int(avaliable_mem*full_ratio) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, config.num_full_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
@@ -150,9 +163,11 @@ class ModelRunner:
             # state ids index pool rows directly: hand the slot count to the
             # scheduler (built after this runner in both engines)
             config.num_linear_states = mamba_pool.num_slots
+            # sentinel: the ids the scheduler hands out must fit this rank's pool
+            assert config.num_linear_states <= mamba_pool.num_slots
 
         li_layer_id = kv_layer_id = 0
-        for layer in self.model.layers:
+        for layer in self.model.model.layers:
             if not hasattr(layer, "self_attn") and hasattr(layer, "linear_attn"):
                 attn = layer.linear_attn.attn
                 attn.conv_cache = mamba_pool.conv_state[li_layer_id]

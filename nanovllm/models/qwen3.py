@@ -14,6 +14,12 @@ from nanovllm.distributed.parallel_state import get_tp_group
 
 class Qwen3Attention(nn.Module):
 
+    # Which norm family this block builds. Qwen3 stores the scale itself, Qwen3.5
+    # stores it zero-centred -- and q_norm/k_norm are built here, so the choice has
+    # to be a hook rather than a literal. Overridden by Qwen3p5Attention.
+    # Class attribute only: `self.norm_cls = ...` would register as a submodule.
+    norm_cls = RMSNorm
+
     def __init__(
         self,
         hidden_size: int,
@@ -73,8 +79,8 @@ class Qwen3Attention(nn.Module):
             self.num_kv_heads,
         )
         if not self.qkv_bias:
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.q_norm = self.norm_cls(self.head_dim, eps=rms_norm_eps)
+            self.k_norm = self.norm_cls(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,

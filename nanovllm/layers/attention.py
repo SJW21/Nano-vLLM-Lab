@@ -79,8 +79,6 @@ class Attention(nn.Module):
 # ==== Linear Attn ====
 def is_torchdynamo_exporting() -> bool:
     try:
-        import torch
-
         return torch.compiler.is_exporting()
     except Exception:
         return False

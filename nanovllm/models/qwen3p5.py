@@ -13,8 +13,9 @@ from nanovllm.layers.gdn_ops import (FLA_CHUNK_SIZE,
                                      l2norm_fwd,
                                      prepare_chunk_indices,
                                      prepare_chunk_offsets)
-from nanovllm.layers.layernorm import RMSNorm, Qwen3p5RMSNormGated
-from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from nanovllm.layers.layernorm import Qwen3p5RMSNorm, Qwen3p5RMSNormGated
+from nanovllm.layers.linear import (QKVParallelLinear, MergedColumnParallelLinear,
+                                    RowParallelLinear, segmented_weight_loader)
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.distributed.parallel_state import get_tp_group
@@ -23,6 +24,11 @@ from contextlib import nullcontext
 
 
 class Qwen3p5Attention(Qwen3Attention):
+
+    # Qwen3.5 folds a +1 into every plain norm -- q/k included, and those two are
+    # built by Qwen3Attention.__init__. The GDN's gated norm is unit-centred and
+    # has its own class.
+    norm_cls = Qwen3p5RMSNorm
 
     def __init__(
         self,
@@ -67,8 +73,15 @@ class Qwen3p5Attention(Qwen3Attention):
             k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
-        o = o * gate.sigmoid()
-        output = self.o_proj(o.flatten(1, -1))
+        # The attention output is [T, H, D] in prefill but [B, 1, H, D] in decode
+        # (flash_attn_with_kvcache is handed q.unsqueeze(1), so it keeps the seqlen
+        # axis). Flatten *both* sides before gating: multiplying the 4-D output by
+        # the 3-D gate broadcasts the seqlen axis into the feature axis
+        # ([2,1,8,256] * [2,8,256] -> [2,2,8,256] -> [2,4096]) -- wrong shape, and
+        # where it does broadcast cleanly (a batch of one) it silently mixes
+        # sequences instead of failing.
+        o = o.flatten(1, -1) * gate.sigmoid().flatten(1, -1)
+        output = self.o_proj(o)
         return output
 
 
@@ -89,6 +102,8 @@ class Qwen3p5GDNState(nn.Module):
 class Qwen3p5GatedDeltaNet(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
+        tp_size = get_tp_group().world_size
+        tp_rank = get_tp_group().local_rank
         self.hidden_size = config.hidden_size
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
@@ -97,37 +112,62 @@ class Qwen3p5GatedDeltaNet(nn.Module):
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
 
+        # The GDN is sharded by contiguous head slices (same design as vLLM): each
+        # rank owns heads [r*H/tp, (r+1)*H/tp) and keeps the state for only those.
+        # Everything at *runtime* must use these; everything *constructed* below
+        # keeps the global sizes, because the parallel linear layers divide their
+        # own dimensions by tp.
+        self.local_num_k_heads = self.num_k_heads // tp_size
+        self.local_num_v_heads = self.num_v_heads // tp_size
+        self.local_key_dim = self.head_k_dim * self.local_num_k_heads
+        self.local_value_dim = self.head_v_dim * self.local_num_v_heads
+
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_idx = layer_idx
         self.layer_norm_epsilon = config.rms_norm_eps
 
         # QKV
         self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.local_conv_dim = self.conv_dim // tp_size
         self.conv1d = nn.Conv1d(
-            in_channels=self.conv_dim,
-            out_channels=self.conv_dim,
+            in_channels=self.local_conv_dim,
+            out_channels=self.local_conv_dim,
             bias=False,
             kernel_size=self.conv_kernel_size,
-            groups=self.conv_dim,
+            groups=self.local_conv_dim,
             padding=self.conv_kernel_size - 1,
         )
+        # the checkpoint stores the depthwise conv as one [conv_dim, 1, W] tensor
+        # covering [q | k | v]; each segment is sharded on its own so a rank's
+        # channels stay inside one of them (see segmented_weight_loader)
+        self.conv1d.weight.weight_loader = segmented_weight_loader(
+            [(self.key_dim, 0, False), (self.key_dim, 0, False), (self.value_dim, 0, False)],
+            tp_size, tp_rank,
+        )
 
-        # projection of the input hidden states
-        projection_size_qkv = self.key_dim * 2 + self.value_dim
-        self.in_proj_qkvz = MergedColumnParallelLinear(self.hidden_size, 
-                                                       [projection_size_qkv, self.value_dim], 
-                                                       bias=False)
-        self.in_proj_ba = MergedColumnParallelLinear(self.hidden_size, 
-                                                     [self.num_v_heads] * 2, 
+        # projection of the input hidden states; four segments rather than two so
+        # each rank's slice of the fused tensor lands inside q / k / v / z
+        self.in_proj_qkvz = MergedColumnParallelLinear(
+            self.hidden_size,
+            [self.key_dim, self.key_dim, self.value_dim, self.value_dim],
+            bias=False,
+        )
+        self.in_proj_ba = MergedColumnParallelLinear(self.hidden_size,
+                                                     [self.num_v_heads] * 2,
                                                      bias=False)
 
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
-        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        # A_log and dt_bias are indexed by the *local* value-head number in the
+        # kernels, so a full-size copy would silently use the wrong half on rank>0
+        self.dt_bias = nn.Parameter(torch.ones(self.local_num_v_heads))
 
         # Lower bound kept away from 0 so log(A) never becomes -inf
-        A = torch.empty(self.num_v_heads).uniform_(0.01, 16)
+        A = torch.empty(self.local_num_v_heads).uniform_(0.01, 16)
         self.A_log = nn.Parameter(torch.log(A))
+        head_loader = segmented_weight_loader([(self.num_v_heads, 0, False)], tp_size, tp_rank)
+        self.A_log.weight_loader = head_loader
+        self.dt_bias.weight_loader = head_loader
 
         self.norm = Qwen3p5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
         self.out_proj = RowParallelLinear(self.value_dim, self.hidden_size, bias=False)
@@ -152,11 +192,11 @@ class Qwen3p5GatedDeltaNet(nn.Module):
         if self._scratch_conv is None or self._scratch_conv.shape[0] < num_states:
             device = self.out_proj.weight.device
             self._scratch_conv = torch.zeros(
-                num_states, self.conv_dim, self.conv_kernel_size - 1,
+                num_states, self.local_conv_dim, self.conv_kernel_size - 1,
                 dtype=self.conv1d.weight.dtype, device=device,
             )
             self._scratch_temporal = torch.zeros(
-                num_states, self.num_v_heads, self.head_v_dim, self.head_k_dim,
+                num_states, self.local_num_v_heads, self.head_v_dim, self.head_k_dim,
                 dtype=torch.float32, device=device,
             )
         return self._scratch_conv, self._scratch_temporal
@@ -243,10 +283,11 @@ class Qwen3p5GatedDeltaNet(nn.Module):
         )
         # q/k keep their own head count: the kernels index the shared key head
         # for each value head (GQA), no repeat_interleave needed.
-        q, k, v = mixed_qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        q = l2norm_fwd(q.reshape(-1, self.num_k_heads, self.head_k_dim)).unsqueeze(0)
-        k = l2norm_fwd(k.reshape(-1, self.num_k_heads, self.head_k_dim)).unsqueeze(0)
-        v = v.reshape(-1, self.num_v_heads, self.head_v_dim).contiguous().unsqueeze(0)
+        q, k, v = mixed_qkv.split([self.local_key_dim, self.local_key_dim,
+                                   self.local_value_dim], dim=-1)
+        q = l2norm_fwd(q.reshape(-1, self.local_num_k_heads, self.head_k_dim)).unsqueeze(0)
+        k = l2norm_fwd(k.reshape(-1, self.local_num_k_heads, self.head_k_dim)).unsqueeze(0)
+        v = v.reshape(-1, self.local_num_v_heads, self.head_v_dim).contiguous().unsqueeze(0)
 
         beta = b.float().sigmoid().contiguous().unsqueeze(0)
         # fp32 A_log: with fp16 weights, .exp() on the raw dtype can underflow to -inf
@@ -256,7 +297,7 @@ class Qwen3p5GatedDeltaNet(nn.Module):
         # sequences resuming a cached prefix continue from that state (and conv
         # window, handled above); everything else starts from zero
         initial_state = torch.zeros(
-            num_seqs, self.num_v_heads, self.head_v_dim, self.head_k_dim,
+            num_seqs, self.local_num_v_heads, self.head_v_dim, self.head_k_dim,
             dtype=torch.float32, device=mixed_qkv.device,
         )
         hit = cached_states >= 0
@@ -283,8 +324,13 @@ class Qwen3p5GatedDeltaNet(nn.Module):
         mixed_qkv = causal_conv1d_update(
             mixed_qkv, conv_weight, conv_bias, conv_state, state_ids
         )
+        # the kernel takes (a, b) -- a drives the decay, b the write strength --
+        # exactly the convention the prefill path uses above. Passing b first
+        # swaps the two gates: the state still tracks something plausible (the
+        # output is RMS-normalised, so a gate mix-up mostly shows up as drift),
+        # which is why this needs the state-level check in tests/test_gdn.py.
         out = fused_recurrent_gdn_decode(
-            mixed_qkv, b, a, self.A_log, self.dt_bias, temporal_state, state_ids,
+            mixed_qkv, a, b, self.A_log, self.dt_bias, temporal_state, state_ids,
             scale=self.head_k_dim ** -0.5,
         )
         # decode snapshots are opt-in (config.enable_decode_snapshot, and eager
@@ -308,7 +354,7 @@ class Qwen3p5GatedDeltaNet(nn.Module):
         # Qwen3.5 stores q/k/v and [b, a] in checkpoint order, so both fused
         # projections split straight down the last dim (no GQA interleaving).
         mixed_qkv, z = projected_qkvz.split(
-            [self.key_dim * 2 + self.value_dim, self.value_dim], dim=-1
+            [self.local_key_dim * 2 + self.local_value_dim, self.local_value_dim], dim=-1
         )
         b, a = projected_ba.chunk(2, dim=-1)
         z = z.reshape(z.shape[0], -1, self.head_v_dim)
@@ -378,8 +424,8 @@ class Qwen3p5DecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Qwen3p5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3p5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -420,8 +466,8 @@ def maybe_autocast(
     requirement that partition IDs be monotonically increasing.
     """
     # version >= 2.5.0
-    import torch
-
+    # (no `import torch` here: it would shadow the module-level one, see
+    # tests/test_static_hygiene.py)
     if device_type == "meta":
         return nullcontext()
     if torch.is_autocast_enabled(device_type) or enabled:
@@ -503,7 +549,7 @@ class Qwen3p5Model(nn.Module):
         config = getattr(config, "text_config", config)
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3p5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3p5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -525,9 +571,10 @@ class Qwen3p5ForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
-        # GDN fused projections.
-        "in_proj_qkv": ("in_proj_qkvz", 0),
-        "in_proj_z": ("in_proj_qkvz", 1),
+        # GDN fused projections. The checkpoint ships in_proj_qkv as one tensor
+        # spanning our first three segments (q|k|v), hence the tuple shard id.
+        "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
+        "in_proj_z": ("in_proj_qkvz", 3),
         "in_proj_b": ("in_proj_ba", 0),
         "in_proj_a": ("in_proj_ba", 1)
     }

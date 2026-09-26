@@ -2,12 +2,19 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
-# Qwen3.x hybrid checkpoints also announce themselves through `layer_types`
-# (linear_attention / full_attention alternating), which covers the text-only and
-# MoE variants this list does not name -- see Config.__post_init__.
+# Opt-in support list: a checkpoint is built as Qwen3.5 (the hybrid GDN stack) iff its
+# `architectures` names one of these. Everything else takes the Qwen3 path.
 hybrid_model_list = {
     "Qwen3_5ForConditionalGeneration"
 }
+
+
+def is_hybrid_config(hf_config) -> bool:
+    """Is this checkpoint one we run on the hybrid (linear-attention) path?
+       See hybrid_model_list for hybrid models have supported.
+    """
+    architectures = getattr(hf_config, "architectures", None) or []
+    return any(a in hybrid_model_list for a in architectures)
 
 
 @dataclass(slots=True)
@@ -57,12 +64,7 @@ class Config:
         # resolve the text half of the checkpoint once (Qwen3.5 VL configs nest it)
         self.text_config = getattr(self.hf_config, "text_config", self.hf_config)
         self.max_model_len = min(self.max_model_len, self.text_config.max_position_embeddings)
-        # `layer_types` is the reliable hybrid marker (dense + MoE, both layouts);
-        # the architecture list is kept as a fallback for older checkpoints
-        self.hybrid_model = (
-            hasattr(self.text_config, "layer_types")
-            or any(a in hybrid_model_list for a in (self.hf_config.architectures or []))
-        )
+        self.hybrid_model = is_hybrid_config(self.hf_config)
         if self.hybrid_model:
             self.num_linear_layers = self.text_config.layer_types.count('linear_attention')
             self.num_full_layers = self.text_config.num_hidden_layers - self.num_linear_layers
