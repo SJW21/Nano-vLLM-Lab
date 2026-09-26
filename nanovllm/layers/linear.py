@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 from nanovllm.distributed.parallel_state import get_tp_group
 
@@ -78,18 +77,11 @@ class ColumnParallelLinear(LinearBase):
 def segmented_weight_loader(spec: list[tuple[int, int, bool]], tp_size: int, tp_rank: int):
     """Shard a checkpoint tensor whose dim 0 concatenates the `spec` segments.
 
-    Each spec entry is ``(full_dim, extra, duplicate_groups)``, the shape of the
-    segment before sharding -- the same convention as vLLM's
-    ``mamba_v2_sharded_weight_loader``, which its GDN layers use for the depthwise
-    conv weight and for A_log / dt_bias (``extra`` > 0 / ``duplicate_groups`` are
-    only for replicated groups, unused here).
-
-    Every segment contributes its own ``full_dim // tp_size`` rows to every rank,
-    so the slice is taken from *inside* each segment rather than across the whole
-    tensor. That is what keeps a rank's q / k / v channels -- and its A_log heads
-    -- contiguous and head-aligned, which the kernels rely on: they index A_log by
-    the local value-head number, and the conv state's row stride is the local
-    conv width.
+    Each entry is ``(full_dim, extra, duplicate_groups)`` -- vLLM's
+    ``mamba_v2_sharded_weight_loader`` convention. The slice is taken from inside
+    every segment (never across the whole tensor) so each rank's channels and
+    A_log heads stay contiguous: the kernels index A_log by the *local* head
+    number and use the local conv width as the state stride.
     """
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         boundary = loaded_boundary = 0
@@ -119,12 +111,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                       loaded_shard_id: int | tuple[int, ...] = None):
         """Load one segment -- or several consecutive ones at once.
 
-        A tuple shard id means the checkpoint tensor spans several fused segments:
-        Qwen3.5 ships the GDN's `in_proj_qkv` as one tensor while we fuse q|k|v|z
-        (same convention as vLLM's `validate_shard_id`). The checkpoint tensor is
-        cut per segment with the *full* widths first -- a plain chunk by tp would
-        hand a rank a slice straddling two segments (rank 0 of tp=2 would get all
-        of q plus the first half of k), which loads without complaint and is wrong.
+        A tuple shard id means the checkpoint tensor spans several fused segments
+        (Qwen3.5 ships the GDN's `in_proj_qkv` as one tensor while we fuse q|k|v|z),
+        so it is cut per segment with the *full* widths first: a plain chunk by tp
+        would straddle two segments and still load without complaint.
         """
         shard_ids = loaded_shard_id if isinstance(loaded_shard_id, tuple) else (loaded_shard_id,)
         for shard_id in shard_ids:
@@ -163,8 +153,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.head_size = head_size
         self.num_heads = divide(total_num_heads, tp_size)
         self.num_kv_heads = divide(total_num_kv_heads, tp_size)
-        # with an output gate each head carries head_size query dims *and*
-        # head_size gate dims, both inside the checkpoint's q_proj
+        # gated attention: head_size query dims and head_size gate dims, both in ckpt q_proj
         self.attn_output_gate = attn_output_gate
         output_size = (total_num_heads * (1 + int(attn_output_gate))
                        + 2 * total_num_kv_heads) * self.head_size

@@ -142,11 +142,8 @@ class BlockManager:
         return None
 
     def alloc_snapshot(self, seq: Sequence) -> int:
-        """No linear state, hence nothing to snapshot.
-
-        Returns the same "no slot" sentinel as the hybrid manager -- the scheduler
-        compares the result against 0, so this must be an int, not ``None``.
-        """
+        """No linear state, hence nothing to snapshot. Must be an int, not ``None``:
+        the scheduler compares the result against 0."""
         return -1
 
     def register_snapshot(self, seq: Sequence):
@@ -160,10 +157,10 @@ class BlockManager:
 
 class HybridBlockManager(BlockManager):
     # hybrid Attention Manager: Linear (mamba state) + Full
+
     def __init__(self, num_blocks, block_size, num_states):
         super().__init__(num_blocks, block_size)
-        # state ids index MambaPool rows directly, so this count must equal the
-        # pool's slot count (ModelRunner writes it into config.num_linear_states)
+        # state ids index MambaPool rows directly, so this is that pool's slot count
         assert num_states > 0, "linear state pool is empty; did allocate_kv_cache run?"
         self.states: list[LinearState] = [LinearState(i) for i in range(num_states)]
         self.free_state_ids: deque[int] = deque(range(num_states))
@@ -243,10 +240,8 @@ class HybridBlockManager(BlockManager):
             block_id = self.hash_table['full'][h]
             revive_and_count_increase(block_id, True)
             seq.block_table.append(block_id)
-            # linear: only the *frontier* block holds the state we resume from
-            # (can_allocate proved it matches there), and that one state covers
-            # every token before it. Reviving the entries of the blocks behind it
-            # would only leak references -- nothing ever reads them.
+            # linear: only the *frontier* block's state is revived -- it covers every token
+            # before it, and the earlier entries are read by nobody (reviving leaks refs)
             if i == num_cached_blocks - 1:
                 state_id = self.hash_table['linear'].get(h, -1)
                 if state_id != -1 and self.states[state_id].token_ids == token_ids:
@@ -269,47 +264,35 @@ class HybridBlockManager(BlockManager):
                 self._deallocate_state(id)
 
     def release_read_slot(self, seq: Sequence):
-        """Drop the read-in slot of a sequence (idempotent).
-
-        ``cached_state`` may alias ``mamba_state`` while a chunked prefill is in
-        flight; that slot is the sequence's working state and must not be
-        released here.
-        """
+        """Drop the read-in slot of a sequence (idempotent). ``cached_state`` may alias
+        ``mamba_state`` mid-chunked-prefill -- that slot is the working state, keep it."""
         if seq.cached_state != -1 and seq.cached_state != seq.mamba_state:
             self.reckoning(seq.cached_state, False)
         seq.cached_state = -1
 
     def carry_state(self, seq: Sequence):
-        """Chunked prefill continuation: the next chunk re-reads what this chunk
-        wrote, so the working slot becomes both source and target."""
+        """Chunked prefill continuation: the next chunk re-reads what this one wrote, so
+        the working slot becomes both source and target."""
         self.release_read_slot(seq)
         seq.cached_state = seq.mamba_state
 
     def alloc_snapshot(self, seq: Sequence):
-        """Reserve the slot this step's forward will write a state snapshot into.
-
-        The scheduler calls this *before* the step, so that every rank learns the
-        destination from the sequence itself (no extra message, no copy channel).
-        The slot stays held (ref_count 1) until ``register_snapshot`` hands it to
-        the hash table, so nothing else can claim it in between.
-        """
+        """Reserve the slot this step's forward will write a snapshot into, *before* the
+        step, so every rank learns the destination from the sequence itself. It stays held
+        (ref_count 1) until ``register_snapshot`` hands it to the hash table."""
         seq.snapshot_state = self._allocate_state() if self.free_state_ids else -1
         return seq.snapshot_state
 
     def register_snapshot(self, seq: Sequence):
-        """Turn the slot the forward just wrote into a prefix-cache entry.
-
-        Must run after ``hash_blocks`` (the entry's key comes from the block the
-        snapshot sits on) and after ``num_cached_tokens`` was advanced. The slot is
-        released right away -- like a block, the hash entry keeps it revivable
-        until it is handed to other tokens.
-        """
+        """Turn the slot the forward just wrote into a prefix-cache entry: must run after
+        ``hash_blocks`` (the key is the block the snapshot sits on) and after
+        ``num_cached_tokens`` advanced. The slot is released right away -- as with a block,
+        the hash entry keeps it revivable until some other token takes it."""
         slot, pos = seq.snapshot_state, seq.snapshot_pos
         seq.snapshot_state, seq.snapshot_pos = -1, -1
         if slot < 0:
             return
-        # state and KV must cover exactly the same prefix, so a snapshot is only
-        # meaningful on a *complete* block boundary
+        # state and KV must cover the same prefix: only a *complete* block boundary counts
         if pos <= 0 or pos > seq.num_cached_tokens or pos % self.block_size:
             self.reckoning(slot, False)
             return
@@ -371,8 +354,8 @@ class MambaShape:
             torch.float16: 2,
         }
         self.conv_dtype = torch.bfloat16
-        # Qwen3.5's config has no mamba_ssm_dtype (that field belongs to the Mamba
-        # family); the GDN kernels are written for fp32 state throughout
+        # Qwen3.5 has no mamba_ssm_dtype (a Mamba-family field), and the GDN kernels are
+        # written for an fp32 state throughout
         self.ssm_dtype = dtype_map[getattr(hf_conf, "mamba_ssm_dtype", "float32")]
 
         self.conv_bytes = self.conv_state_shape[0] * self.conv_state_shape[1] * dtype_size[self.conv_dtype]
@@ -386,14 +369,13 @@ class MambaPool:
                  num_layers: int,
                  device: torch.device
                  ):
-        # [TODO] Support Multi-Type Conv shape, for example, KDA
         shape_param = MambaShape(config)
         state_bytes = num_layers * (shape_param.conv_bytes + shape_param.tempotal_bytes)
         size = mem_size // state_bytes
 
-        # A state slot is one row of both tensors (all layers), and its row index
-        # *is* the id the kernels see: padding uses the -1 sentinel and every
-        # kernel guards it, so no slot needs to be kept in reserve.
+        # a slot is one row of both tensors (over all layers), and that row index *is* the
+        # id the kernels see: padding uses the -1 sentinel, which every kernel guards, so
+        # no slot is kept in reserve
         assert size > 0, f"linear cache holds no state: {mem_size} < {state_bytes}"
         self.num_slots = size
 

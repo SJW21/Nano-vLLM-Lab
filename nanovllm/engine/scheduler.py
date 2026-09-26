@@ -32,21 +32,15 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
 
     def plan_snapshot(self, seq: Sequence, is_decode: bool = False):
-        """Ask for a state snapshot of this step, at the last complete block
-        boundary the step covers.
-
-        That boundary is the only place where the KV cache and the linear state
-        describe the same prefix -- and without a state there, a request that
-        shares the prefix cannot resume from it at all (``can_allocate`` only
-        counts blocks whose state also matched). The slot is reserved here, before
-        the step, so the ids travel with the sequence to every rank and the
-        forward can write them without any copy or extra message.
+        """Ask for a state snapshot of this step, at the last complete block boundary it
+        covers -- the only place where the KV cache and the linear state describe the same
+        prefix. The slot is reserved here, before the step, so the ids travel with the
+        sequence to every rank and the forward can write them without a copy or a message.
         """
         seq.snapshot_state, seq.snapshot_pos = -1, -1
         nct = seq.num_cached_tokens
         pos = (nct + seq.num_scheduled_tokens) // self.block_size * self.block_size
-        # a decode step advances by one token, so pos == nct + 1 is the only way
-        # through here: the snapshot then *is* the working slot as of this step
+        # a decode step advances one token, so pos == nct + 1: the snapshot is the working slot
         if pos <= nct:
             return
         if is_decode:
@@ -55,9 +49,8 @@ class Scheduler:
             if pos % (self.block_size * self.decode_snapshot_interval):
                 return
         elif (pos - nct) % FLA_CHUNK_SIZE:
-            # prefill lifts the state out of the chunked scan, which only knows
-            # per-chunk boundaries; num_cached_tokens is kept block aligned, so
-            # this is a safety net (a decode snapshot needs no such alignment)
+            # the chunked scan only knows per-chunk boundaries; a safety net, since
+            # num_cached_tokens is kept block aligned (decode needs no such alignment)
             return
         if self.block_manager.alloc_snapshot(seq) >= 0:
             seq.snapshot_pos = pos
@@ -91,10 +84,8 @@ class Scheduler:
                 self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             if seq.num_cached_tokens + seq.num_scheduled_tokens < seq.num_tokens:
-                # A later chunk can only snapshot a state where KV and state cover
-                # the same prefix, so keep chunk ends on a block boundary. Budgets
-                # are usually block sized already, so this is normally a no-op
-                # (the leftover < block_size tokens just move to the next step).
+                # a later chunk can only snapshot where KV and state cover the same prefix,
+                # so keep chunk ends on a block boundary (usually a no-op)
                 end = (seq.num_cached_tokens + seq.num_scheduled_tokens) \
                     // self.block_size * self.block_size
                 if end > seq.num_cached_tokens:
@@ -140,8 +131,8 @@ class Scheduler:
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            # the forward wrote this step's snapshot (if one was planned): register
-            # it now that num_cached_tokens and the block hashes are up to date
+            # register the snapshot the forward just wrote, now that num_cached_tokens and
+            # the block hashes are up to date
             self.block_manager.register_snapshot(seq)
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 # chunked prefill: the next chunk re-reads what this one wrote
@@ -150,7 +141,6 @@ class Scheduler:
             elif is_prefill:
                 self.block_manager.release_read_slot(seq)
             seq.append_token(token_id)
-            # [BUGFIX] CUDA Graph Buffer max size is set to "max_tokens" not "prompt_len + completed_len"
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)

@@ -3,7 +3,6 @@ import uuid
 import zmq
 import torch
 import time
-import json
 import pickle
 from nanovllm.config import Config
 from nanovllm.engine.model_runner import ModelRunner
@@ -14,12 +13,8 @@ from nanovllm.utils.profiler import Profiler
 
 
 class DPClient:
-    """
-    The Client for a single DP instance
-        - scheduler: schedule reqs to inference in DP instance until finished;
-        - ModelRunner: execute model to decode the next token
-        - 
-    """
+    """One data-parallel replica: a Scheduler plus a ModelRunner (rank 0 runs inline,
+    the other tp ranks are spawned as workers)."""
     def __init__(self,
                  config: Config,
                  net_config: NetworkConfig,
@@ -28,8 +23,6 @@ class DPClient:
         torch.cuda.set_device(target_rank)
         self.rank = target_rank
         self.tp_size = config.tensor_parallel_size
-        self.dp_size = config.data_parallel_size
-        # [CHECK] uneffective in simple offline test, maybe further check in future.
         self.async_event_loop = config.async_event_loop
 
         # set tp worker
@@ -180,7 +173,6 @@ class DPClient:
             self.profiler.step()
             outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         else:
-            #[TODO] add IDLE sync
             outputs = []
         return outputs
 

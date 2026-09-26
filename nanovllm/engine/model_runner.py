@@ -21,13 +21,10 @@ class ModelRunner:
 
     def __init__(self, config: Config, rank: int, tar_rank: int, event: Event | list[Event]):
         self.config = config
-        # text half of the checkpoint: for Qwen3.5 VL configs the text fields
-        # (dtype, hidden_size, ...) live under text_config, not at the top level
-        hf_config = config.text_config
+        hf_config = config.text_config        # the text half, resolved from either layout
         self.block_size = config.kvcache_block_size
-        # every rank computes slot_mapping from Sequence.num_blocks / last_block_num_tokens,
-        # and spawn'ed workers only ever see the class default (LLMEngine sets it in the
-        # parent process, which does not survive the spawn) -- so set it per rank here
+        # spawn'ed workers only see the class default: LLMEngine sets Sequence.block_size in
+        # the parent process, which does not survive the spawn, so set it per rank here
         Sequence.block_size = self.block_size
         self.enforce_eager = config.enforce_eager
         self.tp_size = config.tensor_parallel_size
@@ -59,11 +56,9 @@ class ModelRunner:
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
-        # Everything compiled above was traced while "cuda" was the ambient default,
-        # and torch.compile guards every graph on torch.utils._device.CURRENT_DEVICE
-        # -- so those graphs are dead from here on ("torch._dynamo hit config.cache_size_limit"). 
-        # Drop them: the kernels they loaded stay alive for the graphs already captured, and the 
-        # serving paths recompile under the cpu default with the whole budget free.
+        # torch.compile guards each graph on the ambient CURRENT_DEVICE, so the flip above kills
+        # every graph compiled under "cuda": drop them (the kernels stay alive for the graphs
+        # already captured) and let the serving paths recompile with the whole cache budget free
         torch._dynamo.reset()
         torch.set_default_dtype(default_dtype)
 
@@ -145,7 +140,7 @@ class ModelRunner:
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * config.num_full_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         avaliable_mem = total * config.gpu_memory_utilization - used - peak + current
-        # sentinel: all tp ranks should have the same num of kv slots
+        # every tp rank must end up with the same num of kv slots
         if self.tp_size > 1:
             budget = torch.tensor([int(avaliable_mem)], dtype=torch.int64, device="cuda")
             dist.all_reduce(budget, op=dist.ReduceOp.MIN, group=get_tp_group().device_group)
@@ -160,11 +155,9 @@ class ModelRunner:
             self.mamba_pool = MambaPool(config, int(avaliable_mem*config.linear_cache_ratio),
                                         config.num_linear_layers, self.kv_cache.device)
             mamba_pool = self.mamba_pool
-            # state ids index pool rows directly: hand the slot count to the
-            # scheduler (built after this runner in both engines)
+            # state ids index pool rows directly: the scheduler (built after this runner in
+            # both engines) reads the slot count off the config
             config.num_linear_states = mamba_pool.num_slots
-            # sentinel: the ids the scheduler hands out must fit this rank's pool
-            assert config.num_linear_states <= mamba_pool.num_slots
 
         li_layer_id = kv_layer_id = 0
         for layer in self.model.model.layers:
@@ -179,7 +172,7 @@ class ModelRunner:
                 attn.v_cache = self.kv_cache[1, kv_layer_id]
                 kv_layer_id += 1
             else:
-                ValueError("Unsupport Attn Type in Model!")
+                raise ValueError("Unsupported attention type in model!")
         assert li_layer_id == config.num_linear_layers, f"bound {li_layer_id} != {config.num_linear_layers}"
         assert kv_layer_id == config.num_full_layers, f"bound {kv_layer_id} != {config.num_full_layers}"
 
@@ -232,8 +225,7 @@ class ModelRunner:
                 state_ids.append(seq.mamba_state)
                 cached_states.append(seq.cached_state)
                 if seq.snapshot_state >= 0:
-                    # where the snapshot sits, as an index into the flattened batch
-                    # (bos, not cu_seqlens_q[-1]: that is this sequence's *end*)
+                    # index into the flattened batch: bos, not cu_seqlens_q[-1] (that is the end)
                     flat = bos + (seq.snapshot_pos - start)
                     assert bos <= flat <= bos + seqlen_q, \
                         f"snapshot position {flat} left sequence [{bos}, {bos + seqlen_q})"
@@ -274,8 +266,7 @@ class ModelRunner:
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
             if self.is_hybrid:
                 state_ids.append(seq.mamba_state)
-                # a decode snapshot is a copy of the working slot after this step,
-                # so it needs no position (only ever set when the scheduler opted in)
+                # a decode snapshot copies the working slot, so it carries no position
                 snapshot_ids.append(seq.snapshot_state)
                 has_snapshot = has_snapshot or seq.snapshot_state >= 0
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)

@@ -1,7 +1,5 @@
 from dataclasses import dataclass
 import zmq
-import os
-import sys
 import time
 import socket
 import psutil
@@ -80,37 +78,18 @@ def get_zmq_socket(
             socket.bind(f"tcp://*:{port}")
             return port, socket
     else:
-        if "[" in endpoint:
-            socket.setsockopt(zmq.IPV6, 1)
-        
         config_socket(socket, socket_type)
 
         if bind:
             socket.bind(endpoint)
         else:
             socket.connect(endpoint)
-        
-        return socket
-    
 
-def get_optimal_endpoint(base_name: str) -> str:
-    """
-    For Single
-    """
-    if os.name == 'posix' and sys.platform != 'darwin':
-        if os.path.exists("/dev/shm"):
-            return f"ipc:///dev/shm/llm_{base_name}_{os.getpid()}"
-        else:
-            return f"ipc:///tmp/llm_{base_name}_{os.getpid()}"
-    else:
-        port = get_free_port()
-        return f"tcp://127.0.0.1:{port}"
+        return socket
 
 
 def send_with_backpressure(socket, data, retry_time: int = 0.1):
-    """
-    Conservative sending strategy, to avoid request backlog leading to sending failures.
-    """
+    """Conservative sending: back off and retry rather than let a backlog fail the send."""
     while True:
         try: 
             socket.send_pyobj(data, zmq.NOBLOCK)

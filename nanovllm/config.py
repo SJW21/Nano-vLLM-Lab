@@ -41,16 +41,14 @@ class Config:
     # derived fields: __post_init__ and ModelRunner assign them, so they must be
     # declared -- dataclass(slots=True) instances have no __dict__
     hybrid_model: bool = False
-    # Qwen3.5 ships in two layouts: a composite (VL) config whose text fields live
-    # under `text_config`, and a text-only config that *is* the text config. All
-    # readers of text fields go through this one, resolved once in __post_init__.
+    # Qwen3.5 ships in two layouts (VL nests the text config, text-only *is* it); every
+    # reader of text fields goes through this one, resolved once in __post_init__
     text_config: AutoConfig | None = None
     num_linear_layers: int = 0
     num_full_layers: int = 0
     num_linear_states: int = -1 # linear state slots, written back by allocate_kv_cache
-    # linear-state prefix snapshots. Prefill takes at most one per step; decode is
-    # off by default (a snapshot per block boundary is far too costly for long
-    # generations) and coarser when enabled, in units of blocks.
+    # linear-state prefix snapshots; decode is off by default (one per block boundary is too
+    # costly for long generations) and coarser when enabled, in units of blocks
     enable_decode_snapshot: bool = False
     decode_snapshot_interval: int = 16
 

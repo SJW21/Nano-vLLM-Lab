@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-import torch.distributed as dist
 from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
@@ -14,10 +13,8 @@ from nanovllm.distributed.parallel_state import get_tp_group
 
 class Qwen3Attention(nn.Module):
 
-    # Which norm family this block builds. Qwen3 stores the scale itself, Qwen3.5
-    # stores it zero-centred -- and q_norm/k_norm are built here, so the choice has
-    # to be a hook rather than a literal. Overridden by Qwen3p5Attention.
-    # Class attribute only: `self.norm_cls = ...` would register as a submodule.
+    # Norm family for q_norm/k_norm, which are built here (Qwen3.5 overrides it). Class
+    # attribute on purpose: `self.norm_cls = ...` would register the class as a submodule.
     norm_cls = RMSNorm
 
     def __init__(
@@ -25,7 +22,7 @@ class Qwen3Attention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        max_position: int = 4096 * 32,
+        max_position: int,
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
@@ -47,8 +44,7 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
-        # Qwen3.5 folds a per-head output gate into q_proj (2*head_dim per head:
-        # first half query, second half gate) and rotates only part of each head
+        # Qwen3.5 folds a per-head output gate into q_proj (first half query, second half gate)
         self.attn_output_gate = attn_output_gate
 
         self.qkv_proj = QKVParallelLinear(

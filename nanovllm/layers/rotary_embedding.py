@@ -11,10 +11,8 @@ def apply_rotary_emb(
 ) -> torch.Tensor:
     """Rotate the first ``rotary_dim`` dims of each head, pass the tail through.
 
-    ``rotary_dim`` defaults to the whole head. It is smaller when the model uses a
-    partial rotary factor (Qwen3.5 rotates 25% of the head): the cos/sin table is
-    built from that many dims, and the remaining dims ride along untouched --
-    same layout as transformers' ``apply_rotary_pos_emb``.
+    Qwen3.5 rotates only 25% of the head (partial rotary); the remaining dims ride
+    along untouched, laid out as in transformers' ``apply_rotary_pos_emb``.
     """
     if rotary_dim is None or rotary_dim == x.shape[-1]:
         x_rot, x_pass = x.float(), None
