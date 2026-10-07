@@ -47,9 +47,10 @@ class LLMEngine:
         self.scheduler = Scheduler(config)
         self.profiler = Profiler(config)
         # async scheduling pipeline state: the batch prepared for the next launch, and
-        # the launched batch whose sampled tokens are consumed one step later
-        self._pending_seqs: list[Sequence] | None = None
-        self._inflight: tuple[list[Sequence], tuple[int, int]] | None = None
+        # the launched batch whose sampled tokens are consumed one step later; each
+        # carries its is_prefill flag, since both kinds run through the same pipeline
+        self._pending: tuple[list[Sequence], bool] | None = None
+        self._inflight: tuple[list[Sequence], bool, tuple[int, int]] | None = None
         atexit.register(self.exit)
 
     def exit(self):
@@ -89,40 +90,37 @@ class LLMEngine:
         return outputs, num_tokens
 
     def _step_async(self):
-        """Run-ahead step: launch the batch prepared by the previous call, then consume
-        the tokens of the step before it. By the time the CPU blocks on those tokens the
-        next step is already enqueued, so the GPU never idles on the D2H round trip."""
+        """Run-ahead step, uniform over prefill and decode: launch the batch prepared by
+        the previous call, then consume the tokens of the step before it. By the time the
+        CPU blocks on those tokens the next step is already enqueued, so the GPU never
+        idles on the D2H round trip -- and a prefill no longer costs a call either."""
         model_runner = self.model_runner
         outputs = []
         # the batch launched by the previous call is the one whose tokens we collect now
         self._inflight, to_consume = None, self._inflight
-        # (1) launch the prepared batch (pure enqueue, never blocks)
-        if self._pending_seqs is not None:
-            handle = model_runner.call("launch_decode", self._pending_seqs)
-            self._inflight = (self._pending_seqs, handle)
-            self._pending_seqs = None
+        # (1) launch the prepared batch (pure enqueue, never blocks); its token count is
+        #     what this call's throughput reports -- read before the consume below zeroes
+        #     num_scheduled_tokens
+        num_tokens = 0
+        if self._pending is not None:
+            seqs, is_prefill = self._pending
+            num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+            method = "launch_prefill" if is_prefill else "launch_decode"
+            self._inflight = (seqs, is_prefill, model_runner.call(method, seqs))
+            self._pending = None
         # (2) consume the previous call's launch -- one step behind, and by the time the
         #     CPU blocks here the next step is already enqueued, so the wait overlaps
         #     useful GPU work instead of leaving a bubble
         if to_consume is not None:
-            seqs, handle = to_consume
-            token_ids = model_runner.wait_decode(handle)
-            self.scheduler.postprocess(seqs, token_ids, is_prefill=False)
-            outputs += [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        # (3) schedule the next batch
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        if not seqs:
-            return outputs, num_tokens
-        # (4) prefill keeps the synchronous path -- its inputs are prompt tokens, current
-        #     on the CPU by construction; every decode batch (graph replay or the eager
-        #     fallback) is prepared here and launched at the top of the next call
-        if is_prefill:
-            token_ids = model_runner.call("run", seqs, is_prefill)
+            seqs, is_prefill, handle = to_consume
+            token_ids = model_runner.wait_sample(handle)
             self.scheduler.postprocess(seqs, token_ids, is_prefill)
             outputs += [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        else:
-            self._pending_seqs = seqs
+        # (3) schedule the next batch; a round in which every sequence is already in
+        #     flight returns nothing, and the pipeline above finishes the work
+        seqs, is_prefill = self.scheduler.schedule()
+        if seqs:
+            self._pending = (seqs, is_prefill)
         return outputs, num_tokens
 
     def is_finished(self):
@@ -159,10 +157,10 @@ class LLMEngine:
                 for seq_id, token_ids in output:
                     outputs[seq_id] = token_ids
                     pbar.update(1)
-            # async scheduling: is_finished() can turn true while the last steps are
-            # still in flight -- drain the pipeline so every sampled token is back on
-            # the CPU before the outputs are collected (bench.py times the whole call)
-            while self._pending_seqs is not None or self._inflight is not None:
+            # async scheduling: safety net -- is_finished() already counts in-flight
+            # batches, so this normally never iterates; if anything is still staged,
+            # drain it so every sampled token is back before the outputs are collected
+            while self._pending is not None or self._inflight is not None:
                 output, _ = self.step()
                 self.profiler.step()
                 for seq_id, token_ids in output:

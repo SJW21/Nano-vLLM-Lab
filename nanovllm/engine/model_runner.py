@@ -386,7 +386,7 @@ class ModelRunner:
     def launch_decode(self, seqs: list[Sequence]) -> tuple[int, int]:
         """Async decode step: enqueue the whole step and return without waiting. The
         sampled tokens go to token_of_slot (the next step's input) and, on the target
-        rank, to a pinned host buffer; wait_decode() collects them one step later.
+        rank, to a pinned host buffer; wait_sample() collects them one step later.
         Every tp rank runs this so the token broadcast lands at the same stream slot."""
         with record_function("prepare_inputs"):
             positions, slots = self.prepare_decode_async(seqs)
@@ -397,20 +397,47 @@ class ModelRunner:
             # only the target rank holds the gathered logits, so it samples; the other
             # ranks receive this step's tokens over the tp group (see _feedback_tokens)
             sampled = self.sampler(logits, temperatures) if self.rank == self.target_rank else None
-            self._feedback_tokens(seqs, sampled, slots)
-            bs = len(seqs)
-            idx = self._copy_idx
-            if self.rank == self.target_rank:
-                self._copy_idx = 1 - idx
-                self.pinned_sampled[idx][:bs].copy_(sampled, non_blocking=True)
-                self.sample_events[idx].record()
+            handle = self._publish_sampled(seqs, sampled, slots)
         reset_context()
+        return handle
+
+    @torch.inference_mode()
+    def launch_prefill(self, seqs: list[Sequence]) -> tuple[int, int]:
+        """Async prefill step: enqueue and return without waiting (same contract as
+        launch_decode). Prompt tokens are CPU-side by construction, so input_ids comes
+        from prepare_prefill; the sampled tokens still land in token_of_slot -- they are
+        the first decode step's input -- and in the pinned buffer for wait_sample().
+        Every tp rank runs this so the token broadcast lands at the same stream slot."""
+        with record_function("prepare_inputs"):
+            input_ids, positions = self.prepare_prefill(seqs)
+            temperatures = self.prepare_sample(seqs) if self.rank == self.target_rank else None
+        with record_function("model"):
+            logits = self.run_model(input_ids, positions, True)
+        with record_function("sample_launch"):
+            sampled = self.sampler(logits, temperatures) if self.rank == self.target_rank else None
+            handle = self._publish_sampled(seqs, sampled)
+        reset_context()
+        return handle
+
+    def _publish_sampled(self, seqs: list[Sequence], sampled: torch.Tensor | None = None,
+                         slots: torch.Tensor | None = None) -> tuple[int, int]:
+        """Publish one sampling event: the device-side scatter (with the tp broadcast,
+        see _feedback_tokens) and, on the target rank, the pinned staging that
+        wait_sample() collects. Returns the wait handle. Shared by launch_prefill and
+        launch_decode so the ping-pong index stays in step across both."""
+        self._feedback_tokens(seqs, sampled, slots)
+        bs = len(seqs)
+        idx = self._copy_idx
+        if self.rank == self.target_rank:
+            self._copy_idx = 1 - idx
+            self.pinned_sampled[idx][:bs].copy_(sampled, non_blocking=True)
+            self.sample_events[idx].record()
         return idx, bs
 
-    def wait_decode(self, handle: tuple[int, int]) -> list[int]:
-        """Collect the tokens enqueued by a previous launch_decode. In steady state the
-        GPU finished that step while the caller was enqueueing the next one, so this
-        wait is ~0 -- that is the entire point of the async path."""
+    def wait_sample(self, handle: tuple[int, int]) -> list[int]:
+        """Collect the tokens enqueued by a previous launch_decode / launch_prefill. In
+        steady state the GPU finished that step while the caller was enqueueing the next
+        one, so this wait is ~0 -- that is the entire point of the async path."""
         idx, bs = handle
         with record_function("sample_wait"):
             self.sample_events[idx].synchronize()
