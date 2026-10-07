@@ -27,6 +27,13 @@ class ModelRunner:
         # the parent process, which does not survive the spawn, so set it per rank here
         Sequence.block_size = self.block_size
         self.enforce_eager = config.enforce_eager
+        # set before warmup_model(), whose run() reads it (see Config.__post_init__ for
+        # the combinations gated off)
+        self.async_scheduling = config.async_scheduling
+        # decode batches up to this size replay a captured graph; larger ones (and all of
+        # decode under enforce_eager) run eager. Both paths read the step's tokens from
+        # token_of_slot, so async scheduling does not care which one a step takes
+        self.max_graph_bs = min(config.max_num_seqs, 512)
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.data_parallel_size
         self.world_size = self.dp_size * self.tp_size
@@ -55,6 +62,16 @@ class ModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+        # async scheduling state
+        if self.async_scheduling:
+            # persistent per-request slot -> latest sampled token: every decode step reads
+            # its input tokens from here (device to device), never through the CPU
+            self.token_of_slot = torch.zeros(config.max_num_seqs, dtype=torch.int64, device="cuda")
+            # ping-pong pinned staging for the deferred D2H of the sampled tokens; sized by
+            # max_num_seqs, not by the graph cap: batches beyond the cap run eager
+            self.pinned_sampled = [torch.empty(config.max_num_seqs, dtype=torch.int64, pin_memory=True) for _ in range(2)]
+            self.sample_events = [torch.cuda.Event() for _ in range(2)]
+            self._copy_idx = 0
         torch.set_default_device("cpu")
         # torch.compile guards each graph on the ambient CURRENT_DEVICE, so the flip above kills
         # every graph compiled under "cuda": drop them (the kernels stay alive for the graphs
@@ -287,11 +304,18 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+    def run_model(self, input_ids: torch.Tensor | None, positions: torch.Tensor, is_prefill: bool,
+                  slots: torch.Tensor | None = None):
+        if slots is not None:
+            # async scheduling: gather each sequence's in-flight token straight from the
+            # device, no per-step H2D of token values. Done before the branch so a graph
+            # replay and the eager fallback (batch beyond the graph cap, enforce_eager)
+            # read the very same source
+            input_ids = self.token_of_slot[slots]
+        if is_prefill or self.enforce_eager or positions.size(0) > self.max_graph_bs:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
-            bs = input_ids.size(0)
+            bs = positions.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
@@ -309,21 +333,113 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        assert is_prefill or not self.async_scheduling, \
+            "decode must go through launch_decode under async scheduling: this path " \
+            "reads seq.last_token, which lags one step behind while a sample is in flight"
         with record_function("prepare_inputs"):
             input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
             temperatures = self.prepare_sample(seqs) if self.rank == self.target_rank else None
         with record_function("model"):
             logits = self.run_model(input_ids, positions, is_prefill)
         with record_function("sample"):
-            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == self.target_rank else None
+            sampled = self.sampler(logits, temperatures) if self.rank == self.target_rank else None
+            if self.async_scheduling:
+                # keep token_of_slot current for the synchronous path -- under async that
+                # is prefill (decode always goes through launch_decode); issued on every
+                # rank so the tp-group broadcast stays in step
+                self._feedback_tokens(seqs, sampled)
+            token_ids = sampled.tolist() if sampled is not None else None
         reset_context()
         return token_ids
+
+    def prepare_decode_async(self, seqs: list[Sequence]):
+        """Decode metadata for the async path: everything except input_ids, which
+        run_model gathers device-side from token_of_slot (no per-step H2D of token
+        values), identically for a graph replay and for the eager fallback."""
+        positions = []
+        slot_mapping = []
+        context_lens = []
+        slots = []
+        state_ids = [] if self.is_hybrid else None
+        for seq in seqs:
+            positions.append(len(seq) - 1)
+            context_lens.append(len(seq))
+            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+            slots.append(seq.slot_id)
+            if self.is_hybrid:
+                state_ids.append(seq.mamba_state)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slots = torch.tensor(slots, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        if self.is_hybrid:
+            state_ids = torch.tensor(state_ids, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        # decode snapshots are a data dependent write a captured graph cannot replay, so
+        # no snapshot ids travel here (Config asserts the two features apart); all
+        # snapshot bookkeeping lives on the synchronous prefill path
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+                    state_ids=state_ids, snapshot_ids=None, has_snapshot=False)
+        return positions, slots
+
+    @torch.inference_mode()
+    def launch_decode(self, seqs: list[Sequence]) -> tuple[int, int]:
+        """Async decode step: enqueue the whole step and return without waiting. The
+        sampled tokens go to token_of_slot (the next step's input) and, on the target
+        rank, to a pinned host buffer; wait_decode() collects them one step later.
+        Every tp rank runs this so the token broadcast lands at the same stream slot."""
+        with record_function("prepare_inputs"):
+            positions, slots = self.prepare_decode_async(seqs)
+            temperatures = self.prepare_sample(seqs) if self.rank == self.target_rank else None
+        with record_function("model"):
+            logits = self.run_model(None, positions, False, slots=slots)
+        with record_function("sample_launch"):
+            # only the target rank holds the gathered logits, so it samples; the other
+            # ranks receive this step's tokens over the tp group (see _feedback_tokens)
+            sampled = self.sampler(logits, temperatures) if self.rank == self.target_rank else None
+            self._feedback_tokens(seqs, sampled, slots)
+            bs = len(seqs)
+            idx = self._copy_idx
+            if self.rank == self.target_rank:
+                self._copy_idx = 1 - idx
+                self.pinned_sampled[idx][:bs].copy_(sampled, non_blocking=True)
+                self.sample_events[idx].record()
+        reset_context()
+        return idx, bs
+
+    def wait_decode(self, handle: tuple[int, int]) -> list[int]:
+        """Collect the tokens enqueued by a previous launch_decode. In steady state the
+        GPU finished that step while the caller was enqueueing the next one, so this
+        wait is ~0 -- that is the entire point of the async path."""
+        idx, bs = handle
+        with record_function("sample_wait"):
+            self.sample_events[idx].synchronize()
+            return self.pinned_sampled[idx][:bs].tolist()
+
+    def _feedback_tokens(self, seqs: list[Sequence], sampled: torch.Tensor | None = None,
+                         slots: torch.Tensor | None = None):
+        """Publish one sampling event's tokens into this rank's token_of_slot.
+
+        The sampler runs on the target rank only, so every other tp rank receives the
+        tokens over a group broadcast on the same stream. All ranks must issue this
+        exactly once per sampling event: a rank-local branch around the collective
+        would desynchronize the group. Both the early-out below and the tensor shapes
+        are derived from the pickled sequence state, so they agree on every rank."""
+        if any(seq.slot_id < 0 for seq in seqs):    # warmup / no slots assigned
+            return
+        if self.tp_size > 1:
+            if sampled is None:                     # non-target ranks: receive buffer
+                sampled = torch.empty(len(seqs), dtype=torch.int64, device="cuda")
+            sampled = get_tp_group().broadcast(sampled)
+        if slots is None:
+            slots = torch.tensor([seq.slot_id for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        self.token_of_slot[slots] = sampled
 
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.text_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = self.max_graph_bs
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)

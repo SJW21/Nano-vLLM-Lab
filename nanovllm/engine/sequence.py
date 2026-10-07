@@ -55,6 +55,13 @@ class Sequence:
         # step so every rank writes the same slot (both -1 => no snapshot)
         self.snapshot_state = -1
         self.snapshot_pos = -1
+        # async scheduling bookkeeping (see Scheduler.schedule / postprocess):
+        # slot_id     -- this sequence's row in ModelRunner.token_of_slot (-1 = unassigned)
+        # pending     -- scheduled decode steps whose sampled token is not consumed yet
+        # placeholder -- token_ids[-1] is reserved for an in-flight token, value not filled
+        self.slot_id = -1
+        self.pending = 0
+        self.placeholder = False
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -101,11 +108,14 @@ class Sequence:
         self.snapshot_pos = -1
 
     def __getstate__(self):
+        # slot_id travels so that every rank scatters a sampled token into the same
+        # row of its own ModelRunner.token_of_slot (async scheduling); pending /
+        # placeholder stay master-side, the workers never run the scheduler
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.cached_state, self.mamba_state, self.snapshot_state, self.snapshot_pos, last_state)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.cached_state, self.mamba_state, self.snapshot_state, self.snapshot_pos, last_state, self.slot_id)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.cached_state, self.mamba_state, self.snapshot_state, self.snapshot_pos, last_state = state
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.cached_state, self.mamba_state, self.snapshot_state, self.snapshot_pos, last_state, self.slot_id = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

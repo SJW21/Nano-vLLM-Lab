@@ -56,6 +56,10 @@ class GroupCoordinator:
     def all_reduce(self, input_:torch.Tensor) -> torch.Tensor:
         dist.all_reduce(input_, group=self.device_group)
 
+    def broadcast(self, input_: torch.Tensor, src: int = 0) -> torch.Tensor:
+        dist.broadcast(input_, src=self.ranks[src], group=self.device_group)
+        return input_
+
     def gather(self, input_: torch.Tensor, dst: int = 0, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         assert -input_.dim() <= dim < input_.dim(), (
