@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import torch._dynamo            # for reset(), see the device flip in __init__
@@ -16,6 +17,12 @@ from nanovllm.distributed.parallel_state import (init_distributed_environment,
                                                  initialize_model_parallel,
                                                  get_tp_group)
 
+# tp command channel: a published-counter header, then two command slots of
+# [seq, length, pickle]; a command goes to the slot matching its parity
+_SHM_HEADER = 8
+_SHM_CMD_SLOT = 2 ** 20
+_SHM_SIZE = _SHM_HEADER + 2 * _SHM_CMD_SLOT
+
 
 class ModelRunner:
 
@@ -27,12 +34,9 @@ class ModelRunner:
         # the parent process, which does not survive the spawn, so set it per rank here
         Sequence.block_size = self.block_size
         self.enforce_eager = config.enforce_eager
-        # set before warmup_model(), whose run() reads it (see Config.__post_init__ for
-        # the combinations gated off)
-        self.async_scheduling = config.async_scheduling
-        # decode batches up to this size replay a captured graph; larger ones (and all of
-        # decode under enforce_eager) run eager. Both paths read the step's tokens from
-        # token_of_slot, so async scheduling does not care which one a step takes
+        self.async_scheduling = config.async_scheduling     # read by warmup_model(), so set before it
+        # decode batches up to this size replay a captured graph; larger ones (and all
+        # decode under enforce_eager) run eager
         self.max_graph_bs = min(config.max_num_seqs, 512)
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.data_parallel_size
@@ -64,12 +68,14 @@ class ModelRunner:
             self.capture_cudagraph()
         # async scheduling state
         if self.async_scheduling:
-            # persistent per-request slot -> latest sampled token: every decode step reads
-            # its input tokens from here (device to device), never through the CPU
+            # per-request slot -> latest sampled token: decode steps read their input
+            # tokens from here, never through the CPU
             self.token_of_slot = torch.zeros(config.max_num_seqs, dtype=torch.int64, device="cuda")
             # ping-pong pinned staging for the deferred D2H of the sampled tokens; sized by
-            # max_num_seqs, not by the graph cap: batches beyond the cap run eager
-            self.pinned_sampled = [torch.empty(config.max_num_seqs, dtype=torch.int64, pin_memory=True) for _ in range(2)]
+            # max_num_seqs (not the graph cap) since larger batches run eager. device="cpu" is
+            # explicit because the ambient default is still "cuda" here and pin_memory=True
+            # rejects an injected device
+            self.pinned_sampled = [torch.empty(config.max_num_seqs, dtype=torch.int64, device="cpu", pin_memory=True) for _ in range(2)]
             self.sample_events = [torch.cuda.Event() for _ in range(2)]
             self._copy_idx = 0
         torch.set_default_device("cpu")
@@ -80,9 +86,11 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
 
         if self.tp_size > 1:
+            self._sent = 0          # target rank: commands published (write_shm)
+            self._received = 0      # workers: commands consumed (read_shm)
             dp_id = self.target_rank // self.tp_size
             if rank == self.target_rank:
-                self.shm = SharedMemory(name=f"nanovllm_dp_{dp_id}", create=True, size=2**20)
+                self.shm = SharedMemory(name=f"nanovllm_dp_{dp_id}", create=True, size=_SHM_SIZE)
                 dist.barrier()
             else:
                 dist.barrier()
@@ -111,19 +119,39 @@ class ModelRunner:
                 profiler.step()
 
     def read_shm(self):
+        """Collect the next command published by the target rank; commands alternate
+        between two slots (protocol and its races: Devlog/v0.3.2.md)."""
         assert self.tp_size > 1 and self.rank != self.target_rank
-        self.event.wait()
-        n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
+        buf = self.shm.buf
+        while int.from_bytes(buf[0:4], "little") <= self._received:
+            # re-check after every clear: the counter, not the event, decides
+            self.event.wait()
+            self.event.clear()
+        seq = self._received
+        self._received += 1
+        base = _SHM_HEADER + (seq % 2) * _SHM_CMD_SLOT
+        got = int.from_bytes(buf[base:base+4], "little")
+        assert got == seq, f"command {got} read where {seq} was expected: the tp " \
+                           f"command channel is out of step"
+        n = int.from_bytes(buf[base+4:base+8], "little")
+        method_name, *args = pickle.loads(buf[base+8:base+8+n])
         return method_name, args
 
     def write_shm(self, method_name, *args):
+        """Publish one command for the workers (read_shm runs it on their side)."""
         assert self.tp_size > 1 and self.rank == self.target_rank
+        seq = self._sent
+        self._sent += 1
         data = pickle.dumps([method_name, *args])
         n = len(data)
-        self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
+        assert 0 < n <= _SHM_CMD_SLOT - 8, f"command of {n} bytes does not fit a shm slot"
+        base = _SHM_HEADER + (seq % 2) * _SHM_CMD_SLOT
+        buf = self.shm.buf
+        buf[base:base+4] = seq.to_bytes(4, "little")
+        buf[base+4:base+8] = n.to_bytes(4, "little")
+        buf[base+8:base+8+n] = data
+        # publish the counter only after the payload is fully written, then ring the bell
+        buf[0:4] = (seq + 1).to_bytes(4, "little")
         for event in self.event:
             event.set()
 
@@ -307,10 +335,8 @@ class ModelRunner:
     def run_model(self, input_ids: torch.Tensor | None, positions: torch.Tensor, is_prefill: bool,
                   slots: torch.Tensor | None = None):
         if slots is not None:
-            # async scheduling: gather each sequence's in-flight token straight from the
-            # device, no per-step H2D of token values. Done before the branch so a graph
-            # replay and the eager fallback (batch beyond the graph cap, enforce_eager)
-            # read the very same source
+            # async decode: gather the step's input tokens on the device, the same source
+            # for a graph replay and for the eager fallback
             input_ids = self.token_of_slot[slots]
         if is_prefill or self.enforce_eager or positions.size(0) > self.max_graph_bs:
             return self.model.compute_logits(self.model(input_ids, positions))
@@ -343,19 +369,13 @@ class ModelRunner:
             logits = self.run_model(input_ids, positions, is_prefill)
         with record_function("sample"):
             sampled = self.sampler(logits, temperatures) if self.rank == self.target_rank else None
-            if self.async_scheduling:
-                # keep token_of_slot current for the synchronous path -- under async that
-                # is prefill (decode always goes through launch_decode); issued on every
-                # rank so the tp-group broadcast stays in step
-                self._feedback_tokens(seqs, sampled)
             token_ids = sampled.tolist() if sampled is not None else None
         reset_context()
         return token_ids
 
     def prepare_decode_async(self, seqs: list[Sequence]):
-        """Decode metadata for the async path: everything except input_ids, which
-        run_model gathers device-side from token_of_slot (no per-step H2D of token
-        values), identically for a graph replay and for the eager fallback."""
+        """Decode metadata for the async path: like prepare_decode, but input_ids is
+        replaced by the slots run_model gathers from token_of_slot."""
         positions = []
         slot_mapping = []
         context_lens = []
@@ -375,27 +395,23 @@ class ModelRunner:
         if self.is_hybrid:
             state_ids = torch.tensor(state_ids, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        # decode snapshots are a data dependent write a captured graph cannot replay, so
-        # no snapshot ids travel here (Config asserts the two features apart); all
-        # snapshot bookkeeping lives on the synchronous prefill path
+        # no snapshot ids here: decode snapshots are gated off against async scheduling
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
                     state_ids=state_ids, snapshot_ids=None, has_snapshot=False)
         return positions, slots
 
     @torch.inference_mode()
     def launch_decode(self, seqs: list[Sequence]) -> tuple[int, int]:
-        """Async decode step: enqueue the whole step and return without waiting. The
-        sampled tokens go to token_of_slot (the next step's input) and, on the target
-        rank, to a pinned host buffer; wait_sample() collects them one step later.
-        Every tp rank runs this so the token broadcast lands at the same stream slot."""
+        """Async decode step: enqueue the whole step and return without waiting; the
+        tokens land in token_of_slot and in pinned staging for wait_sample(). Every tp
+        rank runs this so the broadcast in _feedback_tokens stays in step."""
         with record_function("prepare_inputs"):
             positions, slots = self.prepare_decode_async(seqs)
             temperatures = self.prepare_sample(seqs) if self.rank == self.target_rank else None
         with record_function("model"):
             logits = self.run_model(None, positions, False, slots=slots)
         with record_function("sample_launch"):
-            # only the target rank holds the gathered logits, so it samples; the other
-            # ranks receive this step's tokens over the tp group (see _feedback_tokens)
+            # only the target rank holds the gathered logits, so only it samples
             sampled = self.sampler(logits, temperatures) if self.rank == self.target_rank else None
             handle = self._publish_sampled(seqs, sampled, slots)
         reset_context()
@@ -403,11 +419,8 @@ class ModelRunner:
 
     @torch.inference_mode()
     def launch_prefill(self, seqs: list[Sequence]) -> tuple[int, int]:
-        """Async prefill step: enqueue and return without waiting (same contract as
-        launch_decode). Prompt tokens are CPU-side by construction, so input_ids comes
-        from prepare_prefill; the sampled tokens still land in token_of_slot -- they are
-        the first decode step's input -- and in the pinned buffer for wait_sample().
-        Every tp rank runs this so the token broadcast lands at the same stream slot."""
+        """Async prefill step: same contract as launch_decode; prompt tokens are
+        CPU-side by construction, so input_ids comes from prepare_prefill."""
         with record_function("prepare_inputs"):
             input_ids, positions = self.prepare_prefill(seqs)
             temperatures = self.prepare_sample(seqs) if self.rank == self.target_rank else None
@@ -421,10 +434,9 @@ class ModelRunner:
 
     def _publish_sampled(self, seqs: list[Sequence], sampled: torch.Tensor | None = None,
                          slots: torch.Tensor | None = None) -> tuple[int, int]:
-        """Publish one sampling event: the device-side scatter (with the tp broadcast,
-        see _feedback_tokens) and, on the target rank, the pinned staging that
-        wait_sample() collects. Returns the wait handle. Shared by launch_prefill and
-        launch_decode so the ping-pong index stays in step across both."""
+        """One sampling event: the device-side scatter (via _feedback_tokens) plus, on
+        the target rank, the pinned staging wait_sample() collects. Shared by both
+        launch paths so the ping-pong index stays in step."""
         self._feedback_tokens(seqs, sampled, slots)
         bs = len(seqs)
         idx = self._copy_idx
@@ -435,9 +447,8 @@ class ModelRunner:
         return idx, bs
 
     def wait_sample(self, handle: tuple[int, int]) -> list[int]:
-        """Collect the tokens enqueued by a previous launch_decode / launch_prefill. In
-        steady state the GPU finished that step while the caller was enqueueing the next
-        one, so this wait is ~0 -- that is the entire point of the async path."""
+        """Collect the tokens enqueued by a previous launch_decode / launch_prefill
+        (~0 in steady state: the GPU finished that step while the next was queued)."""
         idx, bs = handle
         with record_function("sample_wait"):
             self.sample_events[idx].synchronize()
@@ -445,19 +456,22 @@ class ModelRunner:
 
     def _feedback_tokens(self, seqs: list[Sequence], sampled: torch.Tensor | None = None,
                          slots: torch.Tensor | None = None):
-        """Publish one sampling event's tokens into this rank's token_of_slot.
-
-        The sampler runs on the target rank only, so every other tp rank receives the
-        tokens over a group broadcast on the same stream. All ranks must issue this
-        exactly once per sampling event: a rank-local branch around the collective
-        would desynchronize the group. Both the early-out below and the tensor shapes
-        are derived from the pickled sequence state, so they agree on every rank."""
+        """Publish one sampling event's tokens into this rank's token_of_slot: the
+        sampler runs on the target rank only, every other rank receives over a group
+        broadcast. All ranks must issue this exactly once per event, and the early-out
+        and shapes below are derived from the (identical) pickled state, so they agree."""
         if any(seq.slot_id < 0 for seq in seqs):    # warmup / no slots assigned
             return
         if self.tp_size > 1:
             if sampled is None:                     # non-target ranks: receive buffer
                 sampled = torch.empty(len(seqs), dtype=torch.int64, device="cuda")
             sampled = get_tp_group().broadcast(sampled)
+            if os.environ.get("NANOVLLM_TRACE_COLLECTIVES"):
+                # tp discipline check: the n-th line must be identical on every rank,
+                # a hang shows up as the last line differing
+                self._coll_count = getattr(self, "_coll_count", 0) + 1
+                print(f"[collective] rank={self.rank} n={self._coll_count} "
+                      f"is_prefill={slots is None} bs={len(seqs)}", flush=True)
         if slots is None:
             slots = torch.tensor([seq.slot_id for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         self.token_of_slot[slots] = sampled

@@ -27,10 +27,7 @@ class Config:
     data_parallel_size: int = 1
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
-    # run-ahead scheduling: launch step k+1 before step k's sampled token is back on
-    # the CPU (device-side token feedback; see __post_init__ for the combinations that
-    # are not wired yet)
-    async_scheduling: bool = False
+    async_scheduling: bool = False      # run-ahead scheduling (gates: __post_init__)
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -73,10 +70,7 @@ class Config:
         else:
             self.num_full_layers, self.num_linear_layers = self.text_config.num_hidden_layers, 0
         if self.async_scheduling:
-            # the async path defers the per-step .tolist() sync; decode is path agnostic
-            # (a captured graph and the eager fallback both gather their tokens from
-            # ModelRunner.token_of_slot), but the two features below still want CPU-side
-            # tokens, so the combination is not wired yet -- fail loudly rather than
-            # silently falling back to the CPU-fed path
+            # these two still need CPU-side per-step tokens, which async defers: fail
+            # loudly instead of silently falling back to the CPU-fed path
             assert not self.enable_decode_snapshot, "async scheduling conflicts with decode snapshots"
             assert self.data_parallel_size == 1, "async scheduling is not wired for data parallelism"

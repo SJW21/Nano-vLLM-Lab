@@ -194,6 +194,10 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# install bash
+install.sh
+
 .opencode
 .claude
 tests/
+3rdparty/
