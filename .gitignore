@@ -201,3 +201,6 @@ install.sh
 .claude
 tests/
 3rdparty/
+
+# AI Infra agent loop 的循环状态与产物，不提交
+.infra-runs/

@@ -70,7 +70,8 @@ class Config:
         else:
             self.num_full_layers, self.num_linear_layers = self.text_config.num_hidden_layers, 0
         if self.async_scheduling:
-            # these two still need CPU-side per-step tokens, which async defers: fail
-            # loudly instead of silently falling back to the CPU-fed path
+            # unimplemented combinations: fail loudly rather than silently downgrade
+            # (decode snapshots need CPU-side per-step tokens, which async defers)
             assert not self.enable_decode_snapshot, "async scheduling conflicts with decode snapshots"
-            assert self.data_parallel_size == 1, "async scheduling is not wired for data parallelism"
+            assert not self.async_event_loop, \
+                "async scheduling is not wired for the threaded event loop (async_event_loop=True)"

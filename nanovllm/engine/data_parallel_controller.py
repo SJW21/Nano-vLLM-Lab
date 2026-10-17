@@ -5,6 +5,7 @@ import torch
 import time
 import pickle
 from nanovllm.config import Config
+from nanovllm.engine import dp_diag
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import Sequence, TokenizedInput
@@ -23,6 +24,7 @@ class DPClient:
         torch.cuda.set_device(target_rank)
         self.rank = target_rank
         self.tp_size = config.tensor_parallel_size
+        self.async_scheduling = config.async_scheduling
         self.async_event_loop = config.async_event_loop
 
         # set tp worker
@@ -44,6 +46,15 @@ class DPClient:
         # init tcp socket
         self.init_tcp_socket(net_config)
         self.handling = True
+        # async scheduling pipeline: the batch prepared for the next launch, and the
+        # launched batch whose tokens are consumed one iteration later
+        self._pending: tuple[list[Sequence], bool] | None = None
+        self._inflight: tuple[list[Sequence], bool, tuple[int, int]] | None = None
+        # sequence ids already sent: a sequence that finished while an over-scheduled
+        # decode row was in flight is still `is_finished` when that row is consumed, so
+        # the result channel (one entry per seq_id) must not repeat it
+        self._reported: set[int] = set()
+        self._diag = dp_diag.install(self)
 
         self.event_loop()
 
@@ -85,9 +96,6 @@ class DPClient:
             except zmq.ZMQError:
                 break
 
-        if not self.handling:
-            self.exit()
-
     def event_loop(self):
         if self.async_event_loop:
             self._event_loop_async()
@@ -100,9 +108,52 @@ class DPClient:
                 self.recv_request()
                 if not self.handling:
                     break
-                outputs = self.step()
+                if self.async_scheduling:
+                    outputs = self._step_async()
+                    self.profiler.step()
+                else:
+                    outputs = self.step()
                 if outputs:
                     send_with_backpressure(self.send_to_control, outputs)
+                if self.async_scheduling and self._idle():
+                    # everything drained: this is the only place allowed to block
+                    self.recv_from_router.poll(timeout=5)
+            if self.async_scheduling:
+                # the exit command arrives after the controller has every result, so this
+                # is empty by protocol; drain anyway rather than drop a future in-flight batch
+                while self._pending is not None or self._inflight is not None:
+                    outputs = self._step_async()
+                    if outputs:
+                        send_with_backpressure(self.send_to_control, outputs)
+        self.exit()
+
+    def _step_async(self):
+        """Run-ahead step (same 4 phases as LLMEngine._step_async), results over the
+        result channel instead of a return value: launch the batch prepared last
+        iteration, consume the one before it, then schedule the next."""
+        outputs = []
+        self._inflight, to_consume = None, self._inflight
+        if self._pending is not None:
+            seqs, is_prefill = self._pending
+            method = "launch_prefill" if is_prefill else "launch_decode"
+            self._inflight = (seqs, is_prefill, self.model_runner.call(method, seqs))
+            self._pending = None
+        if to_consume is not None:
+            seqs, is_prefill, handle = to_consume
+            token_ids = self.model_runner.wait_sample(handle)
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
+            finished = [seq for seq in seqs
+                        if seq.is_finished and seq.seq_id not in self._reported]
+            self._reported.update(seq.seq_id for seq in finished)
+            outputs += [(seq.seq_id, seq.completion_token_ids) for seq in finished]
+        seqs, is_prefill = self.scheduler.schedule()
+        if seqs:
+            self._pending = (seqs, is_prefill)
+        return outputs
+
+    def _idle(self):
+        return self._pending is None and self._inflight is None and \
+            not self.scheduler.waiting and not self.scheduler.running
 
     def _event_loop_async(self):
         import threading
@@ -177,6 +228,8 @@ class DPClient:
         return outputs
 
     def exit(self):
+        if self._diag is not None:
+            self._diag.finalize()
         self.model_runner.call("exit")
         del self.model_runner
         self.recv_from_router.close()
