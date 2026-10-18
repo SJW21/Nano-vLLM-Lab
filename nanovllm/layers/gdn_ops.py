@@ -1,8 +1,8 @@
 """Triton kernels for Qwen3.5's Gated Delta Net (linear attention).
 
-Ported from vLLM 0.26.0's vendored flash-linear-attention kernels; the deliberate
-differences from upstream (no autotune, the dropped TMA/ROCm/prefix-caching branches, the
-re-implemented conv kernels) are recorded in Devlog/v0.3.1.md item 23.
+Ported from vLLM 0.26.0's vendored flash-linear-attention kernels, with deliberate
+differences from upstream: no autotune, the TMA/ROCm/prefix-caching branches are dropped,
+and the conv kernels are re-implemented.
 
 Layout conventions, identical to vLLM/FLA -- and what ``MambaShape`` in
 ``nanovllm/engine/block_manager.py`` assumes:
