@@ -59,7 +59,8 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams) -> int | None:
+        """Queue one request; returns its seq_id, or None when it was rejected."""
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         prompt_len = len(prompt)
@@ -78,6 +79,7 @@ class LLMEngine:
             return
         seq = Sequence(prompt, next(Sequence.counter), sampling_params)
         self.scheduler.add(seq)
+        return seq.seq_id
 
     def step(self):
         if self.config.async_scheduling:
@@ -180,13 +182,14 @@ class DPLLMEngine:
         config = Config(model, **config_kwargs)
         self.config = config
         self.failed: list[FailedRequest] = []
-        self.dp_controller = DataParallelController(config)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        self.seqm = SequenceManager()
         config.eos = self.tokenizer.eos_token_id
+        self.dp_controller = DataParallelController(config)
+        self.seqm = SequenceManager()
         atexit.register(self.exit)
     
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams) -> int | None:
+        """Queue one request; returns its seq_id, or None when it was rejected."""
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         prompt_len = len(prompt)
@@ -205,6 +208,7 @@ class DPLLMEngine:
             return
         seq = TokenizedInput(prompt, self.seqm.get_id, sampling_params)
         self.dp_controller.dispatcher(seq)
+        return seq.seq_id
 
     def generate(
         self,

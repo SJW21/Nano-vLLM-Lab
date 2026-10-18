@@ -7,6 +7,7 @@ import pickle
 from nanovllm.config import Config
 from nanovllm.engine import dp_diag
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.reported_tracker import ReportedTracker
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import Sequence, TokenizedInput
 from nanovllm.utils.network import get_zmq_socket, NetworkConfig, send_with_backpressure
@@ -50,10 +51,11 @@ class DPClient:
         # launched batch whose tokens are consumed one iteration later
         self._pending: tuple[list[Sequence], bool] | None = None
         self._inflight: tuple[list[Sequence], bool, tuple[int, int]] | None = None
-        # sequence ids already sent: a sequence that finished while an over-scheduled
-        # decode row was in flight is still `is_finished` when that row is consumed, so
-        # the result channel (one entry per seq_id) must not repeat it
-        self._reported: set[int] = set()
+        # result-channel de-duplication: a sequence that finished while an over-scheduled
+        # decode row was in flight is still `is_finished` when that row is consumed, so the
+        # result channel (one entry per seq_id) must not repeat it. Ids are tagged with the
+        # in-flight batch that may still repeat them and dropped when that batch is consumed.
+        self._reported = ReportedTracker()
         self._diag = dp_diag.install(self)
 
         self.event_loop()
@@ -133,18 +135,26 @@ class DPClient:
         iteration, consume the one before it, then schedule the next."""
         outputs = []
         self._inflight, to_consume = None, self._inflight
+        inflight_handle = None
         if self._pending is not None:
             seqs, is_prefill = self._pending
             method = "launch_prefill" if is_prefill else "launch_decode"
             self._inflight = (seqs, is_prefill, self.model_runner.call(method, seqs))
+            # ids reported while this batch is in flight may appear in it again
+            inflight_handle = id(self._inflight)
             self._pending = None
         if to_consume is not None:
             seqs, is_prefill, handle = to_consume
             token_ids = self.model_runner.wait_sample(handle)
             self.scheduler.postprocess(seqs, token_ids, is_prefill)
-            finished = [seq for seq in seqs
-                        if seq.is_finished and seq.seq_id not in self._reported]
-            self._reported.update(seq.seq_id for seq in finished)
+            # ids reported while *this* batch was in flight are exactly the ones it may
+            # repeat now: filter against its bucket, retire the bucket, then tag the fresh
+            # ids under the batch launched this step -- the only one that can repeat them
+            consumed_handle = id(to_consume)
+            finished = self._reported.filter_and_report(seqs, consumed_handle)
+            self._reported.on_batch_consumed(consumed_handle)
+            if finished and inflight_handle is not None:
+                self._reported.filter_and_report(finished, inflight_handle)
             outputs += [(seq.seq_id, seq.completion_token_ids) for seq in finished]
         seqs, is_prefill = self.scheduler.schedule()
         if seqs:
