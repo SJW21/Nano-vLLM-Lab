@@ -136,10 +136,10 @@ class DPLLMEngine:
         config = Config(model, **config_kwargs)
         self.config = config
         self.failed: list[FailedRequest] = []
-        self.dp_controller = DataParallelController(config)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        self.seqm = SequenceManager()
         config.eos = self.tokenizer.eos_token_id
+        self.dp_controller = DataParallelController(config)
+        self.seqm = SequenceManager()        
         atexit.register(self.exit)
     
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):

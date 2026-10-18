@@ -3,13 +3,13 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
-version = "0.2.0"
-authors = [{ name = "Xingkai Yu" }]
+name = "nano-vllm-lab"
+version = "0.3"
+authors = [{ name = "Xingkai Yu & Jiawei Shi" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "a lightweight vLLM implementation built from scratch"
+description = "A hands-on fork of nano-vllm — TP/DP, Qwen3.5, etc."
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/SJW21/Nano-vLLM-Lab"
 
 [tool.setuptools.packages.find]
 where = ["."]

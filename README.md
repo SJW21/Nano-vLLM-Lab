@@ -1,54 +1,60 @@
 <p align="center">
-<img width="300" src="assets/logo.png">
+<img width="1000" src="assets/logo.png">
 </p>
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+# Nano-vLLM++ Lab
 
-# Nano-vLLM
+A lightweight vLLM implementation built from scratch, based on
+[nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm) by Xingkai Yu.
+This fork is a personal learning project that extends the original with the features below.
 
-A lightweight vLLM implementation built from scratch.
+## New Features vs Source Repo
 
-## Key Features
-
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Data/Tensor Parallelism, Prefix caching, Torch compilation, CUDA graph, etc.
+- **[Feature] Data Parallelism (DP)** — scale out across GPUs with `data_parallel_size`; each replica runs its own scheduler and model runner, while a controller dispatches batches and gathers results.
+- **[Feature] Profiler** — per-step CPU/CUDA profiling with configurable warm-up and active steps; traces are written to `profiler_output` for TensorBoard.
+- **[Model] Qwen3.5 architecture** — support for the hybrid GDN (linear attention) + full-attention layout, including VL composite checkpoints whose text config is nested under `text_config`.
 
 ## Installation
 
+Requires Python 3.10–3.12 and a CUDA-capable GPU. Clone this repository, then:
+
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+pip install -e .
 ```
+
+`flash-attn` is installed as a dependency. Building it from source can take a while; a
+prebuilt wheel matching your CUDA / PyTorch versions will be much faster.
 
 ## Model Download
 
 To download the model weights manually, use the following command:
-```bash
-export HF_ENDPOINT=https://hf-mirror.com
-hf download Qwen/Qwen3-0.6B \
-  --local-dir ./huggingface/Qwen3-0.6B/
-```
-
-or
 
 ```bash
 pip install modelscope
 python -c "
 from modelscope import snapshot_download
-snapshot_download('Qwen/Qwen3-0.6B', cache_dir='./huggingface/Qwen3-0.6B/')
+snapshot_download('Qwen/Qwen3-0.6B', local_dir='./huggingface/Qwen3-0.6B/')
+"
+```
+
+To experience the Hybrid model, download:
+
+```bash
+python -c "
+from modelscope import snapshot_download
+snapshot_download('Qwen/Qwen3.5-0.8B', local_dir='./huggingface/Qwen3.5-0.8B/')
 "
 ```
 
 ## Quick Start
 
 See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
+
 ```python
 from nanovllm import LLM, SamplingParams
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
+prompts = ["Hello, Nano-vLLM++ Lab."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
@@ -57,20 +63,8 @@ outputs[0]["text"]
 
 See `bench.py` for benchmark.
 
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
+New baseline numbers for this fork are being measured — coming soon.
 
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
+---
 
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+*Feature descriptions are being expanded and will be published soon.*
