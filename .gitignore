@@ -82,6 +82,7 @@ target/
 profile_default/
 ipython_config.py
 
+install.sh
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is
 #   intended to run in multiple environments; otherwise, check them in:
@@ -196,6 +197,8 @@ cython_debug/
 
 .opencode
 .claude
-
-# remove test file (not final test files)
 tests/
+
+.infra-runs
+3rdparty/*
+Devlog/
