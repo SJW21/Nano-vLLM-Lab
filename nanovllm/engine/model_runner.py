@@ -59,15 +59,14 @@ class ModelRunner:
             self.model = Qwen3ForCausalLM(hf_config)
             load_model(self.model, config.model)
         self.sampler = Sampler()
-        # graph 档位上界（capture 与 MoE buffer pool 容量共用同一份）
+        # graph 档位上界
         self.graph_max_bs = min(self.config.max_num_seqs, 512)
         if is_moe:
-            # MoE 计算路径一次成型：拼装 MoEWeights（并释放 HF 布局源参数）、
-            # 建跨层共享的 graph buffer pool。必须在 warmup/capture 之前——
-            # warmup 的 eager prefill 同时完成两个 grouped GEMM kernel 的
-            # autotune 预热，capture 内不再触发 host sync。
-            self.model.finalize_moe(
-                max_tokens=max(self._graph_batch_sizes(self.graph_max_bs)))
+            # MoE 权重一次成型：拼装 MoEWeights（并释放 HF 布局源参数）。
+            # 必须在 warmup/capture 之前——warmup 的 eager prefill 同时完成
+            # 两个 grouped GEMM kernel 的 autotune 预热，capture 内不再触发
+            # autotune（其内部含同步，会 abort capture）。
+            self.model.finalize_moe()
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -264,7 +263,7 @@ class ModelRunner:
         return token_ids
 
     def _graph_batch_sizes(self, max_bs: int) -> list[int]:
-        """graph 档位列表（capture 与 MoE buffer pool 容量共用同一份）。
+        """graph 档位列表。
 
         小 bs 细粒度，大 bs 按 16 步进；顶档 = ceil(max_bs/16)*16，允许略超
         max_bs（capture 时 input_ids[:bs] 自动截断），保证任意 bs <= max_bs
@@ -289,7 +288,7 @@ class ModelRunner:
         self.graph_pool = None
 
         # 注：每档 capture 前的 warmup（下面 outputs[:bs] = self.model(...)）
-        # 在 capture 外执行整模型 forward → MoE 走 staged 路径 → 两个 grouped
+        # 在 capture 外执行整模型 forward → MoE 走同一条单路径 → 两个 grouped
         # GEMM kernel 的 autotune 与编译在 capture 之前完成，capture 内不再有
         # host sync（autotune benchmark 含 events/同步，在 capture 内会 abort）。
         for bs in reversed(self.graph_bs):

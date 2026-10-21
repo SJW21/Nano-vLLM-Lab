@@ -7,9 +7,10 @@ reduce-scatter combine）在当前布局下的退化实现——token 在 TP 组
 dispatch 是恒等操作，combine 退化为一次 all_reduce（DP>1 的 AG[DP] + RS
 见 plan S6）。
 
-CUDA graph：中间张量必须预分配、地址固定（见 moe_gemm.MoEGraphBuffers），
-因此 `finalize_moe()` 在加载后一次成型；层内按 capture 状态三分支，见
-`_moe_compute`。
+CUDA graph：中间张量由 `moe_forward` 在调用时按实际路由行数分配。capture
+区内运行时它们落在图的私有内存池里，replay 复用同一地址；capture 外落到
+普通 caching allocator。因此 eager 与 graph 共用同一条 compute path，不存在
+分支，也不需要在加载后预分配 buffer。
 """
 
 import torch
@@ -17,9 +18,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from nanovllm.layers.linear import ReplicatedLinear
-from nanovllm.layers.moe_gemm import (
-    MoEWeights, MoEGraphBuffers, moe_forward, moe_forward_graph,
-    moe_forward_graph_captured)
+from nanovllm.layers.moe_gemm import MoEWeights, moe_forward
 from nanovllm.distributed.parallel_state import get_ep_group, get_tp_group
 
 
@@ -112,10 +111,8 @@ class MoELayer(nn.Module):
         self.stacked_down_tp.weight_loader = _make_tp_loader_m_dim1()
 
         # moe_gemm 计算路径：finalize_moe() 之后就绪。
-        # _moe_weights 持有转置后的专家权重（MoEWeights 自己的拷贝），
-        # _moe_bufs 持有 graph 兼容的固定 buffer（pool 共享时只建 stage 表）。
+        # _moe_weights 持有转置后的专家权重（MoEWeights 自己的拷贝）。
         self._moe_weights = None
-        self._moe_bufs = None
 
     # ------------------------------------------------------------------
     # 计算路径（moe_gemm grouped GEMM）
@@ -126,17 +123,16 @@ class MoELayer(nn.Module):
         """finalize_moe() 是否已完成（幂等入口判断用）。"""
         return self._moe_weights is not None
 
-    def finalize_moe(self, pool=None, max_tokens=None):
+    def finalize_moe(self):
         """加载完成后、warmup 之前调用一次（幂等）。
 
         1. stacked_gate_tp/up_tp → w1 = [E, 2*M_EP, H]（gate 在前、up 在后，
            匹配 fused kernel 在 half = N//2 处的 gate/up 切分）→ MoEWeights；
-        2. 释放 HF 布局的源参数——EP=4 时 302MB/层 × 48 ≈ 14.5GB，权重出现
-           第二份副本会直接 OOM（32GB 卡）；
-        3. 构造 MoEGraphBuffers（传 pool 时跨层共享 buffer，只建本层 stage 表）。
+        2. 释放 HF 布局的源参数——EP=4 时每层约 302MB × 48 ≈ 14.5GB，权重出现
+           第二份副本会直接 OOM（32GB 卡）。
 
-        注意：_GroupedGemmStage 会把权重与 buffer 的 data_ptr 烘进表里，
-        finalize 之后不得再移动/重建权重或 buffer。
+        注意：MoEWeights 在构造时把每个专家的权重地址写进设备表（b_ptrs），
+        finalize 之后不得再移动/重建权重。
         """
         if self._moe_weights is not None:
             return
@@ -145,29 +141,16 @@ class MoELayer(nn.Module):
         self._moe_weights = MoEWeights(w1, down)
         del self.stacked_gate_tp, self.stacked_up_tp, self.stacked_down_tp
         del w1, down
-        self._moe_bufs = MoEGraphBuffers(self._moe_weights, max_tokens=max_tokens,
-                                         top_k=self.top_k, pool=pool)
 
     def _moe_compute(self, hidden_states, topk_weights, topk_ids):
-        """moe_gemm 计算路径三分支：图内 / staged / eager。
+        """单一路径：workspace 由 moe_forward 按实际路由行数现场分配。
 
-        与 model_runner 的 eager/graph 分流方向一致：
-          - capture 区内 → 图内入口（输入来自图私有内存池，地址跨 replay 稳定）；
-          - 图外且装得下 pool 容量 → staged（set_inputs + 固定 buffer）；
-          - 图外且超容量（大 batch prefill）→ eager 动态分配。
-
-        三条路径共用同一 kernel 与同一段计算逻辑，差别只在数据组织方式。
+        capture 内分配落在图私有内存池，capture 外落在普通 caching allocator；
+        两者是同一段 Python 代码，不需要任何分支。
         """
-        if self._moe_bufs is None:
+        if self._moe_weights is None:
             raise RuntimeError(
                 "MoE 计算路径需要先调用 finalize_moe()（加载完成后、warmup 前）")
-        bufs = self._moe_bufs
-        if torch.cuda.is_current_stream_capturing():
-            return moe_forward_graph_captured(
-                bufs, hidden_states, topk_weights, topk_ids)
-        if hidden_states.size(0) <= bufs.max_tokens:
-            h, w, ids = bufs.set_inputs(hidden_states, topk_weights, topk_ids)
-            return moe_forward_graph(bufs, h, w, ids)
         return moe_forward(hidden_states, topk_weights, topk_ids, self._moe_weights)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

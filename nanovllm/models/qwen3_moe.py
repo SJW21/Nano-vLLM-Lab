@@ -162,28 +162,18 @@ class Qwen3MoEModel(nn.Module):
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def finalize_moe(self, max_tokens: int) -> None:
-        """加载完成后、warmup 之前调用一次（幂等；非 moe_tp 直接返回）。
+    def finalize_moe(self) -> None:
+        """加载完成后、warmup 之前调用一次（幂等；dense 模型不进此路径）。
 
-        建一份跨层共享的 MoEGraphBufferPool（容量按 graph 档位顶档
-        max_tokens），再逐层 finalize：拼装 MoEWeights、释放 HF 布局源参数、
-        建每层的 grouped GEMM stage 表。详见 MoELayer.finalize_moe。
+        逐层 finalize：拼装 MoEWeights、释放 HF 布局源参数。不再有跨层共享
+        的 buffer pool——workspace 由 moe_forward 按每次实际路由行数分配。
+        详见 MoELayer.finalize_moe。
         """
-        from nanovllm.layers.moe_gemm import MoEGraphBufferPool
         layers = [layer.mlp for layer in self.layers]
-        first = layers[0]
-        if first.moe_finalized:
+        if layers[0].moe_finalized:
             return   # 幂等（dense 模型不进此路径，见 ModelRunner 的 is_moe 判断）
-        pool = MoEGraphBufferPool(
-            dtype=first.stacked_gate_tp.dtype,
-            num_experts=first.num_experts,
-            hidden_size=first.hidden_size,
-            intermediate_size=first.moe_intermediate_size // first.ep_size,
-            max_tokens=max_tokens,
-            top_k=first.top_k,
-        )
         for mlp in layers:
-            mlp.finalize_moe(pool=pool)
+            mlp.finalize_moe()
 
     def forward(
         self,
@@ -224,6 +214,14 @@ class Qwen3MoEForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+
+    def finalize_moe(self) -> None:
+        """MoE 计算路径一次性成型（加载后、warmup 前）。
+
+        ModelRunner 持有的是顶层 CausalLM，故在此委托给内层
+        Qwen3MoEModel.finalize_moe（逐层 finalize 权重）。
+        """
+        self.model.finalize_moe()
 
     def forward(
         self,
