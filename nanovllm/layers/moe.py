@@ -25,9 +25,10 @@ from nanovllm.distributed.parallel_state import get_ep_group, get_tp_group
 class MoELayer(nn.Module):
     """Mixture-of-Experts layer（moe_tp）。
 
-    权重布局：全专家本地持有，每个专家沿 intermediate（M）维切 EP 份
-      - stacked_gate_tp / stacked_up_tp: [E, M/EP, D]
-      - stacked_down_tp:                  [E, D, M/EP]
+    权重布局：全专家本地持有，每个专家沿 intermediate（M）维切 EP 份，
+    直接存成 kernel 的 K-major 终局布局：
+      - stacked_gate_tp / stacked_up_tp: [E, D, M/EP]
+      - stacked_down_tp:                  [E, M/EP, D]
     （EP>1 是 32GB 显存的硬约束：全量专家权重的完整副本 58GB/rank 不可行，
     M 维切分后约 14.5GB/rank。）
 
@@ -88,30 +89,33 @@ class MoELayer(nn.Module):
         # Named "gate" to match HF checkpoint key: model.layers.X.mlp.gate.weight
         self.gate = ReplicatedLinear(hidden_size, num_experts, bias=False)
 
-        # --- Stacked expert weights: ALL experts × M/EP slice ---
-        self.stacked_gate_tp = nn.Parameter(torch.empty(num_experts, M_EP, hidden_size))
-        self.stacked_up_tp = nn.Parameter(torch.empty(num_experts, M_EP, hidden_size))
-        self.stacked_down_tp = nn.Parameter(torch.empty(num_experts, hidden_size, M_EP))
+        # --- Stacked expert weights: ALL experts × M/EP slice, K-major ---
+        # 终局布局与 kernel 的 B 一致：gate/up 存成 [E, H, M_EP]，down 存成
+        # [E, M_EP, H]。这样 finalize 只需 cat gate|up 一次，不再逐 expert
+        # 转置拷贝（省掉一份完整权重副本）。
+        self.stacked_gate_tp = nn.Parameter(torch.empty(num_experts, hidden_size, M_EP))
+        self.stacked_up_tp = nn.Parameter(torch.empty(num_experts, hidden_size, M_EP))
+        self.stacked_down_tp = nn.Parameter(torch.empty(num_experts, M_EP, hidden_size))
         # M 维 narrow loader：切片索引 = rank 在 EP group 内位置（EP group = 全体
         # rank → ep_rank）。HF loaded_weight 布局：gate/up = [M, D]（M 在 dim0）；
-        # down = [D, M]（M 在 dim1）。
+        # down = [D, M]（M 在 dim1）。窄化后转置写入 K-major 参数。
         m_slice = self.ep_rank * M_EP
-        def _make_tp_loader_m_dim0():      # gate/up：loaded [M, D] 的 M 维 = dim0
+        def _make_tp_loader_m_dim0():      # gate/up：loaded [M, D] -> param [D, M_EP]
             def loader(param, loaded_weight, expert_id=0):
-                w = loaded_weight.narrow(0, m_slice, M_EP)
-                param.data[expert_id].copy_(w)
+                w = loaded_weight.narrow(0, m_slice, M_EP)   # [M_EP, D]
+                param.data[expert_id].copy_(w.t())           # [D, M_EP]
             return loader
-        def _make_tp_loader_m_dim1():      # down：loaded [D, M] 的 M 维 = dim1
+        def _make_tp_loader_m_dim1():      # down：loaded [D, M] -> param [M_EP, D]
             def loader(param, loaded_weight, expert_id=0):
-                w = loaded_weight.narrow(1, m_slice, M_EP)
-                param.data[expert_id].copy_(w)
+                w = loaded_weight.narrow(1, m_slice, M_EP)   # [D, M_EP]
+                param.data[expert_id].copy_(w.t())           # [M_EP, D]
             return loader
         self.stacked_gate_tp.weight_loader = _make_tp_loader_m_dim0()
         self.stacked_up_tp.weight_loader   = _make_tp_loader_m_dim0()
         self.stacked_down_tp.weight_loader = _make_tp_loader_m_dim1()
 
         # moe_gemm 计算路径：finalize_moe() 之后就绪。
-        # _moe_weights 持有转置后的专家权重（MoEWeights 自己的拷贝）。
+        # _moe_weights 直接持有 stacked K-major 权重（w13/w2），不再有逐 expert 拷贝。
         self._moe_weights = None
 
     # ------------------------------------------------------------------
@@ -126,21 +130,23 @@ class MoELayer(nn.Module):
     def finalize_moe(self):
         """加载完成后、warmup 之前调用一次（幂等）。
 
-        1. stacked_gate_tp/up_tp → w1 = [E, 2*M_EP, H]（gate 在前、up 在后，
-           匹配 fused kernel 在 half = N//2 处的 gate/up 切分）→ MoEWeights；
+        1. stacked_gate_tp/up_tp（已是 [E, H, M_EP]）→ w13 = cat(dim=2)
+           = [E, H, 2*M_EP]（gate 在前、up 在后，匹配 fused kernel 的
+           half = N//2 切分）→ MoEWeights；
         2. 释放 HF 布局的源参数——EP=4 时每层约 302MB × 48 ≈ 14.5GB，权重出现
            第二份副本会直接 OOM（32GB 卡）。
 
-        注意：MoEWeights 在构造时把每个专家的权重地址写进设备表（b_ptrs），
-        finalize 之后不得再移动/重建权重。
+        MoEWeights 直接持有 w13/down 的 stacked 张量，不再做逐 expert 转置
+        拷贝，也不再需要 b_ptrs 设备表。注意逐层 cat + 立即 del：若先收集所有
+        层的 cat 再统一释放，峰值会多出约 9.7GB。
         """
         if self._moe_weights is not None:
             return
-        w1 = torch.cat([self.stacked_gate_tp.data, self.stacked_up_tp.data], dim=1)
+        w13 = torch.cat([self.stacked_gate_tp.data, self.stacked_up_tp.data], dim=2)
         down = self.stacked_down_tp.data
-        self._moe_weights = MoEWeights(w1, down)
+        self._moe_weights = MoEWeights(w13, down)
         del self.stacked_gate_tp, self.stacked_up_tp, self.stacked_down_tp
-        del w1, down
+        del w13, down
 
     def _moe_compute(self, hidden_states, topk_weights, topk_ids):
         """单一路径：workspace 由 moe_forward 按实际路由行数现场分配。

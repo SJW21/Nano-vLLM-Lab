@@ -1,10 +1,12 @@
 """Grouped-GEMM MoE (`moe_tp`): one compute path for eager and CUDA graph.
 
-Weights are K-major and expert-local: `w1[e]` is `(H, 2I_local)` and `w2[e]` is
-`(I_local, H)`, where `I_local = moe_intermediate_size / ep_size`. The kernel
-walks the experts in one persistent launch (virtual-SM scheduling: grid is
-`NUM_SM`, a program strides over tiles with `tile_idx += NUM_SM`), so the launch
-topology does not depend on the batch or on the routing.
+Weights are stacked and K-major: `w13` is `(E, H, 2I_local)` and `w2` is
+`(E, I_local, H)`, where `I_local = moe_intermediate_size / ep_size`. The
+kernel locates expert `g` with `B + g * (K * N)`; there is no per-expert
+pointer table. It walks the experts in one persistent launch (virtual-SM
+scheduling: grid is `NUM_SM`, a program strides over tiles with
+`tile_idx += NUM_SM`), so the launch topology does not depend on the batch or
+on the routing.
 
 Routing is sorted on the device (`argsort(stable=True)`), counted with a
 `scatter_add_` histogram, and turned into an exclusive prefix sum with
@@ -151,7 +153,7 @@ MAX_BLOCK_K = max(_max_block(_GEMM_CONFIGS, 'BLOCK_SIZE_K'),
 @triton.autotune(configs=_GEMM_CONFIGS, key=['group_size'])
 @triton.jit
 def grouped_matmul_kernel_masked(
-    A_ptr, b_ptrs, C_ptr,
+    A_ptr, B, C_ptr,
     # [E] device tensors: rows routed to each expert, and their exclusive prefix
     # sum (the first row of expert g). Both are produced on the device each call.
     counts, row_offsets,
@@ -182,7 +184,8 @@ def grouped_matmul_kernel_masked(
             # row0 must be int64: rows * stride can exceed int32 for prefill.
             row0 = tl.load(row_offsets + g).to(tl.int64)
             a_ptr = A_ptr + row0 * lda
-            b_ptr = tl.load(b_ptrs + g).to(tl.pointer_type(DTYPE))
+            # B is a single stacked (E, K, N) tensor: expert g starts at g*K*N.
+            b_ptr = B + g.to(tl.int64) * (K * N)
             c_ptr = C_ptr + row0 * ldc
 
             tile_idx_in_gemm = tile_idx - last_problem_end
@@ -251,7 +254,7 @@ def grouped_matmul_kernel_masked(
 @triton.autotune(configs=_SILU_GEMM_CONFIGS, key=['group_size'])
 @triton.jit
 def grouped_matmul_silu_kernel_masked(
-    A_ptr, b_ptrs, C_ptr,
+    A_ptr, B, C_ptr,
     counts, row_offsets,
     lda, ldb, ldc,
     group_size,
@@ -278,7 +281,8 @@ def grouped_matmul_silu_kernel_masked(
         while (tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles):
             row0 = tl.load(row_offsets + g).to(tl.int64)
             a_ptr = A_ptr + row0 * lda
-            b_ptr = tl.load(b_ptrs + g).to(tl.pointer_type(DTYPE))
+            # B is a single stacked (E, K, N) tensor: expert g starts at g*K*N.
+            b_ptr = B + g.to(tl.int64) * (K * N)
             c_ptr = C_ptr + row0 * ldc
 
             tile_idx_in_gemm = tile_idx - last_problem_end
@@ -354,45 +358,40 @@ def grouped_matmul_silu_kernel_masked(
 # =============================================================================
 
 class MoEWeights:
-    """Expert weights in K-major layout, prepared once at model construction.
+    """Stacked expert weights in K-major layout, prepared once at load time.
 
     Args:
-        w1: (E, 2I, H) -- merged gate/up projection, nn.Linear layout.
-        w2: (E, H, I)  -- down projection.
+        w13: (E, H, 2I) -- merged gate/up projection, K-major.
+        w2:  (E, I, H)  -- down projection, K-major.
 
-    Each expert is stored as its own contiguous (K, N) tensor. That is why the
-    kernel needs a device pointer table (`w1_b_ptrs` / `w2_b_ptrs`): one
-    `data_ptr()` per expert, built once here and never rebuilt. A later
-    refactoring can stack the experts into one `(E, K, N)` tensor and replace
-    the table with `base + g * K * N`; until then the table is the only
-    address-dependent state.
+    The kernel locates expert g's slice with `B + g * (K * N)`; there is no
+    per-expert pointer table and no per-expert copy here. The caller must keep
+    both tensors contiguous and must not move them after construction (their
+    addresses are baked into captured graphs).
     """
 
-    def __init__(self, w1: torch.Tensor, w2: torch.Tensor):
-        assert w1.dim() == 3 and w2.dim() == 3, "expected (E, out, in) tensors"
-        assert w1.dtype == w2.dtype, (
-            f"w1 and w2 must share one dtype, got {w1.dtype} / {w2.dtype}")
-        self.dtype = w1.dtype
+    def __init__(self, w13: torch.Tensor, w2: torch.Tensor):
+        assert w13.dim() == 3 and w2.dim() == 3, "expected (E, K, N) tensors"
+        assert w13.dtype == w2.dtype, (
+            f"w13 and w2 must share one dtype, got {w13.dtype} / {w2.dtype}")
+        self.dtype = w13.dtype
         _triton_dtype(self.dtype)         # reject anything the kernels cannot take
-        num_experts, two_i, hidden = w1.shape
-        assert w2.shape == (num_experts, hidden, two_i // 2), (
-            f"w2 shape {tuple(w2.shape)} is not the (E, H, I) matching "
-            f"w1 {tuple(w1.shape)}")
+        num_experts, hidden, two_i = w13.shape
+        assert two_i % 2 == 0, f"w13's N must be 2I (even), got {two_i}"
+        assert w2.shape == (num_experts, two_i // 2, hidden), (
+            f"w2 shape {tuple(w2.shape)} is not the (E, I, H) matching "
+            f"w13 {tuple(w13.shape)}")
+        assert w13.is_contiguous() and w2.is_contiguous(), (
+            "stacked expert weights must be contiguous; the kernel addresses "
+            "expert g as base + g * K * N")
         self.num_experts = num_experts
         self.hidden_size = hidden
         self.intermediate_size = two_i // 2
-        # non-TMA kernels want B as (K, N) contiguous; the weights are fixed, so
-        # this transpose happens here and never inside the forward pass
-        self.w1 = [w1[e].t().contiguous() for e in range(num_experts)]   # (H, 2I)
-        self.w2 = [w2[e].t().contiguous() for e in range(num_experts)]   # (I, H)
-        device = w1.device
-        self.w1_b_ptrs = torch.tensor(
-            [w.data_ptr() for w in self.w1], dtype=torch.int64, device=device)
-        self.w2_b_ptrs = torch.tensor(
-            [w.data_ptr() for w in self.w2], dtype=torch.int64, device=device)
+        self.w13 = w13
+        self.w2 = w2
 
     def __repr__(self):
-        mb = sum(w.numel() * w.element_size() for w in self.w1 + self.w2) / 1e6
+        mb = (self.w13.numel() + self.w2.numel()) * self.w13.element_size() / 1e6
         return (f"MoEWeights(E={self.num_experts}, H={self.hidden_size}, "
                 f"I={self.intermediate_size}, {mb:.0f}MB {self.dtype})")
 
@@ -463,19 +462,21 @@ def _unpermute_into(ws: _MoEWorkspace, num_tokens, top_k):
     return ws.final[:num_tokens].copy_(ws.acc[:num_tokens])
 
 
-def _even_flags(K, N, lda, ldb, fused: bool):
+def _even_flags(K, N, lda, ldb, fused: bool, stride_be=None):
     """(EVEN_K, EVEN_N) for the masked kernels, from the uniform shapes.
 
     `stride(0) % 16 == 0` is required because EVEN_* also enables a
     `tl.multiple_of(..., [16, 16])` alignment hint; an unaligned stride would
-    make that hint a lie and produce wrong results. For the fused kernel,
-    EVEN_N tests the output width half = N // 2, not B's N.
+    make that hint a lie and produce wrong results. `stride_be` is the stacked
+    expert stride K*N: the same hint is applied to B, so it must be aligned too.
+    For the fused kernel, EVEN_N tests the output width half = N // 2.
     """
     even_k = (K % MAX_BLOCK_K == 0) and (lda % 16 == 0)
+    aligned_b = (ldb % 16 == 0) and (stride_be is None or stride_be % 16 == 0)
     if fused:
-        even_n = (N % 2 == 0) and ((N // 2) % MAX_BLOCK_N == 0) and (ldb % 16 == 0)
+        even_n = (N % 2 == 0) and ((N // 2) % MAX_BLOCK_N == 0) and aligned_b
     else:
-        even_n = (N % MAX_BLOCK_N == 0) and (ldb % 16 == 0)
+        even_n = (N % MAX_BLOCK_N == 0) and aligned_b
     return even_k, even_n
 
 
@@ -507,9 +508,9 @@ def moe_forward(hidden_states, topk_weights, topk_ids, weights: MoEWeights):
     _align_into(ws, hidden_states, topk_weights, topk_ids, top_k)
 
     even_k, even_n = _even_flags(hidden_size, 2 * inter, hidden_size, 2 * inter,
-                                 fused=True)
+                                 fused=True, stride_be=hidden_size * 2 * inter)
     grouped_matmul_silu_kernel_masked[(lambda META: (META['NUM_SM'],))](
-        ws.permuted, weights.w1_b_ptrs, ws.act,
+        ws.permuted, weights.w13, ws.act,
         ws.counts, ws.row_offsets,
         hidden_size, 2 * inter, inter,
         num_experts,
@@ -519,9 +520,9 @@ def moe_forward(hidden_states, topk_weights, topk_ids, weights: MoEWeights):
     )
 
     even_k, even_n = _even_flags(inter, hidden_size, inter, hidden_size,
-                                 fused=False)
+                                 fused=False, stride_be=inter * hidden_size)
     grouped_matmul_kernel_masked[(lambda META: (META['NUM_SM'],))](
-        ws.act, weights.w2_b_ptrs, ws.down,
+        ws.act, weights.w2, ws.down,
         ws.counts, ws.row_offsets,
         inter, hidden_size, hidden_size,
         num_experts,
