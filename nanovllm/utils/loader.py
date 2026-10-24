@@ -11,21 +11,17 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 
 def _remap_expert_weight(weight_name: str) -> tuple[str | None, int | None]:
-    """把 HF 专家权重名映射到 stacked_*_tp 参数（moe_tp）。
+    """Map an HF expert weight name to its stacked_*_tp parameter.
 
-    HF checkpoint 按全局 ID 命名专家（experts.{0..E-1}.{gate,up,down}_proj.weight）；
-    本框架每个 rank 持有全部专家、沿 intermediate（M）维切 EP 份，因此：
-      - 名字映射到 stacked_gate_tp / stacked_up_tp / stacked_down_tp；
-      - expert_id 保持全局 id（0..num_experts-1），对应 stacked_*_tp 的行号；
-      - M 维 narrow 由 param 自身的 weight_loader 完成（切片索引 = ep_rank）；
-        ep_size==1 时 M_EP == I（全量），narrow(0, 0, I) 为恒等切片。
+    The checkpoint names experts globally
+    (experts.{0..E-1}.{gate,up,down}_proj.weight). Every rank holds all
+    experts and one EP slice of the intermediate dimension, so the parameter
+    name becomes stacked_gate_tp / stacked_up_tp / stacked_down_tp,
+    expert_id stays the global id (the row in the stacked parameter), and the
+    M-dim narrow happens in the parameter's weight_loader.
 
-    Args:
-        weight_name: HF weight name (e.g. "model.layers.0.mlp.experts.42.gate_proj.weight").
-
-    Returns:
-        ``(param_name, expert_id)`` 供三参 weight_loader 使用；
-        非专家权重返回 ``(weight_name, None)``，按普通参数加载。
+    Returns (param_name, expert_id); non-expert weights return
+    (weight_name, None).
     """
     m = re.search(r"experts\.(\d+)\.", weight_name)
     if m is None:
@@ -50,8 +46,8 @@ def load_model(model: nn.Module, path: str, num_experts: int | None = None):
     Args:
         model: the model to load weights into.
         path: directory containing .safetensors files.
-        num_experts: total number of experts. MoE 模型必填（专家权重需要 remap
-            到 stacked_*_tp）；dense 模型传 None，不做任何 remap。
+        num_experts: total number of experts for MoE models (expert weights
+            are remapped to stacked_*_tp); pass None for dense models.
     """
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     for file in glob(os.path.join(path, "*.safetensors")):

@@ -101,7 +101,6 @@ class Qwen3MoEDecoderLayer(nn.Module):
         config: Qwen3Config,
         ep_size: int = 1,
         ep_rank: int = 0,
-        moe_mode: str = "tp",
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3MoEAttention(
@@ -122,7 +121,6 @@ class Qwen3MoEDecoderLayer(nn.Module):
             top_k=config.num_experts_per_tok,
             ep_size=ep_size,
             ep_rank=ep_rank,
-            moe_mode=moe_mode,
             hidden_act=config.hidden_act,
             norm_topk_prob=getattr(config, "norm_topk_prob", True),
         )
@@ -152,28 +150,25 @@ class Qwen3MoEModel(nn.Module):
         config: Qwen3Config,
         ep_size: int = 1,
         ep_rank: int = 0,
-        moe_mode: str = "tp",
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
-            Qwen3MoEDecoderLayer(config, ep_size, ep_rank, moe_mode)
+            Qwen3MoEDecoderLayer(config, ep_size, ep_rank)
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def finalize_moe(self) -> None:
-        """加载完成后、warmup 之前调用一次（幂等；dense 模型不进此路径）。
+        """Finalize every MoE layer after loading and before warmup.
 
-        逐层 finalize：拼装 MoEWeights、释放 HF 布局源参数。不再有跨层共享
-        的 buffer pool——workspace 由 moe_forward 按每次实际路由行数分配。
-        详见 MoELayer.finalize_moe。
+        Idempotent. Dense models never reach this path; see ModelRunner's
+        `is_moe` check.
         """
-        layers = [layer.mlp for layer in self.layers]
-        if layers[0].moe_finalized:
-            return   # 幂等（dense 模型不进此路径，见 ModelRunner 的 is_moe 判断）
-        for mlp in layers:
-            mlp.finalize_moe()
+        if self.layers[0].mlp.moe_finalized:
+            return
+        for layer in self.layers:
+            layer.mlp.finalize_moe()
 
     def forward(
         self,
@@ -207,20 +202,15 @@ class Qwen3MoEForCausalLM(nn.Module):
         config: Qwen3Config,
         ep_size: int = 1,
         ep_rank: int = 0,
-        moe_mode: str = "tp",
     ) -> None:
         super().__init__()
-        self.model = Qwen3MoEModel(config, ep_size, ep_rank, moe_mode)
+        self.model = Qwen3MoEModel(config, ep_size, ep_rank)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def finalize_moe(self) -> None:
-        """MoE 计算路径一次性成型（加载后、warmup 前）。
-
-        ModelRunner 持有的是顶层 CausalLM，故在此委托给内层
-        Qwen3MoEModel.finalize_moe（逐层 finalize 权重）。
-        """
+        """Delegate to the inner model (ModelRunner holds the causal LM)."""
         self.model.finalize_moe()
 
     def forward(

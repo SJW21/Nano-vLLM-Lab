@@ -1,34 +1,19 @@
-"""Grouped-GEMM MoE (`moe_tp`): one compute path for eager and CUDA graph.
+"""Grouped-GEMM MoE with stacked, K-major expert weights.
 
-Weights are stacked and K-major: `w13` is `(E, H, 2I_local)` and `w2` is
-`(E, I_local, H)`, where `I_local = moe_intermediate_size / ep_size`. The
-kernel locates expert `g` with `B + g * (K * N)`; there is no per-expert
-pointer table. It walks the experts in one persistent launch (virtual-SM
-scheduling: grid is `NUM_SM`, a program strides over tiles with
-`tile_idx += NUM_SM`), so the launch topology does not depend on the batch or
-on the routing.
+`w13` is `(E, H, 2I_local)` and `w2` is `(E, I_local, H)`, where
+`I_local = moe_intermediate_size / ep_size`. Expert `g` starts at
+`B + g * (K * N)`; there is no per-expert pointer table. One persistent
+kernel launch walks the experts with virtual-SM scheduling, so the launch
+topology is fixed for any batch and routing.
 
-Routing is sorted on the device (`argsort(stable=True)`), counted with a
-`scatter_add_` histogram, and turned into an exclusive prefix sum with
-`cumsum`. The kernels read the per-expert work size from the device `counts`
-tensor and locate each expert's rows with `row_offsets`; no host-side read of
-the routing is ever needed. That is what makes the whole path capturable: a
-host read (`.item()`/`.tolist()`) inside a capture aborts it, and a host-built
-pointer table baked into the graph silently reads the capture-time values on
-replay.
-
-Allocation: every call sizes its workspace from the **actual number of routed
-token-expert pairs**, `T * top_k`. Per-expert `M_i` are device values and only
-drive the number of tiles, never an allocation size -- using them for shapes
-would require a device-to-host sync. The workspace is created with plain
-`torch.empty` inside `moe_forward`; there is no cross-layer buffer pool.
-
-CUDA graph: the same Python function runs inside and outside capture. When it
-runs inside `torch.cuda.graph(pool=...)`, the allocations land in that graph's
-private memory pool, so replay reuses the same addresses. Outside capture they
-land in the normal caching allocator. The only rule the caller must respect is
-that the returned tensor is consumed before the next replay (it is a view of
-the caller's graph-pool memory when captured).
+Routing is device-side (stable argsort, scatter_add_ histogram, cumsum), so
+there is no host sync and the path is CUDA-graph capturable. `moe_forward`
+sizes its workspace from the actual routed row count `T * top_k`; per-expert
+M_i only drive the tile count, never an allocation. Inside
+`torch.cuda.graph(pool=...)` the allocations come from the graph's private
+pool and replay reuses their addresses; outside capture they use the normal
+caching allocator. The returned tensor is graph-pool memory when captured, so
+the caller must consume it before the next replay.
 """
 
 import torch
@@ -36,22 +21,14 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = [
-    "MoEWeights", "moe_forward",
-    "grouped_matmul_kernel_masked", "grouped_matmul_silu_kernel_masked",
-    "DEVICE",
-]
-
-DEVICE = torch.device("cuda")
+__all__ = ["MoEWeights", "moe_forward"]
 
 
 def num_sms() -> int:
     """SM count of the active device.
 
-    This runs at import time (the autotune lists below are module-level constants),
-    so it falls back rather than raising when there is no live CUDA device. That
-    only affects the autotune candidate set: NUM_SM is a grid size, so any value
-    is functionally correct, just potentially slower.
+    Called at import time for the autotune tables, so fall back when no CUDA
+    device is live. NUM_SM only affects performance, not correctness.
     """
     try:
         return torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -63,10 +40,9 @@ def num_sms() -> int:
 # 1. Autotune configuration
 # =============================================================================
 #
-# Two lists, one per kernel. They must be kept **symmetric**: the only reason to
-# have two is that the fused kernel carries two fp32 accumulators instead of one
-# and therefore has different register pressure. If the fused list is narrower
-# in some tile, that shows up as a bogus "fusion is slower" result.
+# Keep the two lists symmetric. The fused kernel carries two fp32 accumulators
+# instead of one, so it has different register pressure; a narrower list would
+# make "fusion is slower" an artifact of the candidate set.
 
 _GEMM_CONFIGS = [
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'NUM_SM': 84}),
@@ -75,15 +51,9 @@ _GEMM_CONFIGS = [
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'NUM_SM': 128}),
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'NUM_SM': num_sms()}),
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'NUM_SM': num_sms()}),
-    # The three entries below carry num_warps=8. The six above do not, so they
-    # all fall back to Triton's default of 4 warps -- under which a 128x128 fp32
-    # accumulator (16384 registers, 128/thread) plus operands necessarily spills,
-    # and autotune simply never picks the large tiles. Adding these made a
-    # 128/128/64 tile reachable and took the masked kernel from 8.17ms to 6.57ms.
-    #
-    # Keep them in sync with _SILU_GEMM_CONFIGS: with a fused kernel carrying two
-    # accumulators (32768 registers at 128x128) the 8-warp variants are what make
-    # that tile possible at all. Narrowing only one list would rig the comparison.
+    # num_warps=8 makes the 128x128 tiles viable: at the default 4 warps the
+    # fp32 accumulator spills. Keep both config lists symmetric; narrowing one
+    # would rig the fused-vs-unfused comparison.
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32,
                    'NUM_SM': num_sms()}, num_warps=8),
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64,
@@ -92,9 +62,8 @@ _GEMM_CONFIGS = [
                    'NUM_SM': num_sms()}, num_warps=8),
 ]
 
-# Fused gate_up + SiLU. The K/N block sizes here must not exceed MAX_BLOCK_K /
-# MAX_BLOCK_N below, or the even-flag predicates would judge the *unfused*
-# limits against a fused config and drop a mask that is still needed.
+# Fused gate_up + SiLU. Block sizes must stay within MAX_BLOCK_K/MAX_BLOCK_N
+# below, or the even-flag predicates could drop a mask that is still needed.
 _SILU_GEMM_CONFIGS = [
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'NUM_SM': 84}),
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'NUM_SM': 128}),
@@ -135,11 +104,10 @@ def _triton_dtype(torch_dtype: torch.dtype):
         ) from None
 
 
-# Largest BLOCK_SIZE per axis across both config lists. A dimension that is a
-# multiple of these is a multiple of every config's block size, which is exactly
-# what EVEN_K / EVEN_N test for -- so this has to be the **max**, over the union
-# of both lists. A smaller bound would let a config with a larger block size pass
-# the predicate with a mask it still needs, i.e. an out-of-bounds store.
+# Largest BLOCK_SIZE per axis over both config lists. EVEN_K/EVEN_N may only
+# drop a mask when the dimension is a multiple of every config's block size, so
+# this must be the max over the union; a smaller bound could drop a needed mask
+# and store out of bounds.
 MAX_BLOCK_N = max(_max_block(_GEMM_CONFIGS, 'BLOCK_SIZE_N'),
                   _max_block(_SILU_GEMM_CONFIGS, 'BLOCK_SIZE_N'))
 MAX_BLOCK_K = max(_max_block(_GEMM_CONFIGS, 'BLOCK_SIZE_K'),
@@ -358,16 +326,15 @@ def grouped_matmul_silu_kernel_masked(
 # =============================================================================
 
 class MoEWeights:
-    """Stacked expert weights in K-major layout, prepared once at load time.
+    """Stacked K-major expert weights.
 
     Args:
-        w13: (E, H, 2I) -- merged gate/up projection, K-major.
-        w2:  (E, I, H)  -- down projection, K-major.
+        w13: (E, H, 2I) merged gate/up projection (gate half first).
+        w2:  (E, I, H) down projection.
 
-    The kernel locates expert g's slice with `B + g * (K * N)`; there is no
-    per-expert pointer table and no per-expert copy here. The caller must keep
-    both tensors contiguous and must not move them after construction (their
-    addresses are baked into captured graphs).
+    The kernel addresses expert g as `B + g * (K * N)`. Both tensors must stay
+    contiguous and in place after construction: captured graphs bake in their
+    addresses.
     """
 
     def __init__(self, w13: torch.Tensor, w2: torch.Tensor):
@@ -410,14 +377,13 @@ class _MoEWorkspace:
 
     __slots__ = ("permuted", "act", "down", "final", "counts", "row_offsets",
                  "token_idx", "sorted_weights", "count_f", "ones_f",
-                 "scratch", "acc", "rows")
+                 "scratch", "acc")
 
 
 def _alloc_workspace(num_tokens, top_k, hidden_size, intermediate_size,
                      num_experts, dtype, device) -> _MoEWorkspace:
     rows = num_tokens * top_k
     ws = _MoEWorkspace()
-    ws.rows = rows
     ws.permuted = torch.empty((rows, hidden_size), dtype=dtype, device=device)
     ws.act = torch.empty((rows, intermediate_size), dtype=dtype, device=device)
     ws.down = torch.empty((rows, hidden_size), dtype=dtype, device=device)
@@ -462,17 +428,17 @@ def _unpermute_into(ws: _MoEWorkspace, num_tokens, top_k):
     return ws.final[:num_tokens].copy_(ws.acc[:num_tokens])
 
 
-def _even_flags(K, N, lda, ldb, fused: bool, stride_be=None):
+def _even_flags(K, N, lda, ldb, fused: bool):
     """(EVEN_K, EVEN_N) for the masked kernels, from the uniform shapes.
 
     `stride(0) % 16 == 0` is required because EVEN_* also enables a
     `tl.multiple_of(..., [16, 16])` alignment hint; an unaligned stride would
-    make that hint a lie and produce wrong results. `stride_be` is the stacked
-    expert stride K*N: the same hint is applied to B, so it must be aligned too.
+    make that hint a lie and produce wrong results. The stacked expert stride
+    is K * N, and the same hint is applied to B, so it must be aligned too.
     For the fused kernel, EVEN_N tests the output width half = N // 2.
     """
     even_k = (K % MAX_BLOCK_K == 0) and (lda % 16 == 0)
-    aligned_b = (ldb % 16 == 0) and (stride_be is None or stride_be % 16 == 0)
+    aligned_b = (ldb % 16 == 0) and ((K * N) % 16 == 0)
     if fused:
         even_n = (N % 2 == 0) and ((N // 2) % MAX_BLOCK_N == 0) and aligned_b
     else:
@@ -508,7 +474,7 @@ def moe_forward(hidden_states, topk_weights, topk_ids, weights: MoEWeights):
     _align_into(ws, hidden_states, topk_weights, topk_ids, top_k)
 
     even_k, even_n = _even_flags(hidden_size, 2 * inter, hidden_size, 2 * inter,
-                                 fused=True, stride_be=hidden_size * 2 * inter)
+                                 fused=True)
     grouped_matmul_silu_kernel_masked[(lambda META: (META['NUM_SM'],))](
         ws.permuted, weights.w13, ws.act,
         ws.counts, ws.row_offsets,
@@ -520,7 +486,7 @@ def moe_forward(hidden_states, topk_weights, topk_ids, weights: MoEWeights):
     )
 
     even_k, even_n = _even_flags(inter, hidden_size, inter, hidden_size,
-                                 fused=False, stride_be=inter * hidden_size)
+                                 fused=False)
     grouped_matmul_kernel_masked[(lambda META: (META['NUM_SM'],))](
         ws.act, weights.w2, ws.down,
         ws.counts, ws.row_offsets,

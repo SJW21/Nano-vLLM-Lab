@@ -1,16 +1,13 @@
-"""MoE 层（moe_tp）：全专家 × 1/EP intermediate 分片 + AllReduce[EP]。
+"""Mixture-of-Experts layer (`moe_tp`).
 
-计算走 `moe_gemm` 的 grouped GEMM（jagged M、无固定容量、virtual-SM 调度）；
-通信为纯集合通信（无 a2a）：每 rank 只计算自己 M 分片的 partial，AR[EP] 在
-全 EP 组上求和得到完整输出。这是 AgRs 形态（all-gather dispatch +
-reduce-scatter combine）在当前布局下的退化实现——token 在 TP 组内一致时
-dispatch 是恒等操作，combine 退化为一次 all_reduce（DP>1 的 AG[DP] + RS
-见 plan S6）。
+Every rank holds all experts and one 1/EP slice of the intermediate
+dimension. Experts are evaluated with grouped GEMMs and combined with one
+all-reduce over the EP group; there is no all-to-all, because tokens are
+replicated across TP ranks.
 
-CUDA graph：中间张量由 `moe_forward` 在调用时按实际路由行数分配。capture
-区内运行时它们落在图的私有内存池里，replay 复用同一地址；capture 外落到
-普通 caching allocator。因此 eager 与 graph 共用同一条 compute path，不存在
-分支，也不需要在加载后预分配 buffer。
+Eager and CUDA-graph execution share one path: `moe_forward` allocates its
+workspace per call, and inside `torch.cuda.graph(pool=...)` those allocations
+come from the graph's private pool.
 """
 
 import torch
@@ -23,23 +20,17 @@ from nanovllm.distributed.parallel_state import get_ep_group, get_tp_group
 
 
 class MoELayer(nn.Module):
-    """Mixture-of-Experts layer（moe_tp）。
+    """MoE MLP: all experts local, intermediate dimension sharded by EP.
 
-    权重布局：全专家本地持有，每个专家沿 intermediate（M）维切 EP 份，
-    直接存成 kernel 的 K-major 终局布局：
-      - stacked_gate_tp / stacked_up_tp: [E, D, M/EP]
-      - stacked_down_tp:                  [E, M/EP, D]
-    （EP>1 是 32GB 显存的硬约束：全量专家权重的完整副本 58GB/rank 不可行，
-    M 维切分后约 14.5GB/rank。）
+    Weights use the kernel's terminal K-major layout:
+      - stacked_gate_tp / stacked_up_tp: [E, H, M/EP]
+      - stacked_down_tp:                  [E, M/EP, H]
+    Sharding the intermediate dimension keeps Qwen3-30B-A3B at about
+    14.5GB/rank for EP=4; a full copy would not fit a 32GB card.
 
-    数据流（DP=1）：
-        gate → topk_routing → grouped GEMM（本 rank 的 M 分片 → partial）
-        → AR[EP] 求和 → 输出
-    路由每 rank 独立计算：token 在 TP 组内一致（attention 沿 head 维切分 +
-    AR），各 rank 的 topk 结果因此一致，partial 可按 token 直接求和。
-
-    旧 moe_ep（All2All/fixbuf）路径已移除（git 历史可查）；moe_mode 保留为
-    单值开关，传入旧值会得到明确报错。
+    With DP=1, routing is identical on every rank (tokens are replicated
+    across TP), so each rank computes its M-shard partial and one all-reduce
+    over EP produces the full output.
     """
 
     def __init__(
@@ -50,146 +41,104 @@ class MoELayer(nn.Module):
         top_k: int,
         ep_size: int,
         ep_rank: int,
-        moe_mode: str = "tp",
         hidden_act: str = "silu",
         norm_topk_prob: bool = True,
     ):
         super().__init__()
-        assert hidden_act == "silu", "Only SiLU activation is supported for MoE experts."
-        assert moe_mode == "tp", (
-            f"moe_mode={moe_mode!r} 不受支持：moe_ep（All2All 后端）已移除，"
-            f"当前仅支持 'tp'（AllReduce 后端）")
-        assert num_experts % ep_size == 0, \
-            f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size})"
-        assert moe_intermediate_size % ep_size == 0, \
-            f"moe_intermediate_size ({moe_intermediate_size}) must be divisible by ep_size ({ep_size})"
+        assert hidden_act == "silu", "MoE experts support only SiLU."
+        assert moe_intermediate_size % ep_size == 0, (
+            f"moe_intermediate_size ({moe_intermediate_size}) must be "
+            f"divisible by ep_size ({ep_size})")
         M_EP = moe_intermediate_size // ep_size
-        # M/EP 必须是 64 的倍数：down 阶段 K = M/EP，K % 64 != 0 会使 grouped
-        # GEMM 的 EVEN_K 失效（退化为逐元素 mask 路径）。A3B（I=768）下
-        # EP ∈ {1,2,4}，EP=8（M/EP=96）被此断言拒绝。
-        assert M_EP % 64 == 0, \
-            f"M/EP = {M_EP} must be a multiple of 64 (EP={ep_size} 使 down 的 EVEN_K 失效)"
+        # down_proj has K = M/EP; EVEN_K requires a multiple of 64.
+        assert M_EP % 64 == 0, (
+            f"M/EP = {M_EP} must be a multiple of 64 (ep_size={ep_size})")
 
-        self.hidden_size = hidden_size
-        self.moe_intermediate_size = moe_intermediate_size
-        self.num_experts = num_experts
+        tp_size = get_tp_group().world_size
+        if ep_size > tp_size:
+            raise NotImplementedError(
+                f"EP ({ep_size}) > TP ({tp_size}) would require data "
+                "parallelism; DP>1 is not implemented")
+
         self.top_k = top_k
         self.ep_size = ep_size
-        self.ep_rank = ep_rank
-        self.moe_mode = moe_mode
         self.norm_topk_prob = norm_topk_prob
-        self.tp_size = get_tp_group().world_size
-        self.dp_size = ep_size // self.tp_size
-        if self.dp_size > 1:
-            raise NotImplementedError(
-                "DP>1 暂不支持（plan S6 预留 AG[DP] + RS/AR 骨架）；"
-                "当前实现要求 EP == TP（DP=1）")
 
-        # Router (gate): fully replicated, small weight footprint
-        # Named "gate" to match HF checkpoint key: model.layers.X.mlp.gate.weight
+        # Router is replicated; named "gate" to match the HF checkpoint.
         self.gate = ReplicatedLinear(hidden_size, num_experts, bias=False)
 
-        # --- Stacked expert weights: ALL experts × M/EP slice, K-major ---
-        # 终局布局与 kernel 的 B 一致：gate/up 存成 [E, H, M_EP]，down 存成
-        # [E, M_EP, H]。这样 finalize 只需 cat gate|up 一次，不再逐 expert
-        # 转置拷贝（省掉一份完整权重副本）。
-        self.stacked_gate_tp = nn.Parameter(torch.empty(num_experts, hidden_size, M_EP))
-        self.stacked_up_tp = nn.Parameter(torch.empty(num_experts, hidden_size, M_EP))
-        self.stacked_down_tp = nn.Parameter(torch.empty(num_experts, M_EP, hidden_size))
-        # M 维 narrow loader：切片索引 = rank 在 EP group 内位置（EP group = 全体
-        # rank → ep_rank）。HF loaded_weight 布局：gate/up = [M, D]（M 在 dim0）；
-        # down = [D, M]（M 在 dim1）。窄化后转置写入 K-major 参数。
-        m_slice = self.ep_rank * M_EP
-        def _make_tp_loader_m_dim0():      # gate/up：loaded [M, D] -> param [D, M_EP]
+        # Expert weights in the kernel's terminal layout, so finalize only
+        # has to concatenate gate|up (no per-expert transpose copy).
+        self.stacked_gate_tp = nn.Parameter(
+            torch.empty(num_experts, hidden_size, M_EP))
+        self.stacked_up_tp = nn.Parameter(
+            torch.empty(num_experts, hidden_size, M_EP))
+        self.stacked_down_tp = nn.Parameter(
+            torch.empty(num_experts, M_EP, hidden_size))
+
+        # HF layouts: gate/up [M, D] (M in dim 0), down [D, M] (M in dim 1).
+        # Narrow the EP slice, then transpose into K-major.
+        m_slice = ep_rank * M_EP
+
+        def _make_tp_loader_m_dim0():
             def loader(param, loaded_weight, expert_id=0):
                 w = loaded_weight.narrow(0, m_slice, M_EP)   # [M_EP, D]
                 param.data[expert_id].copy_(w.t())           # [D, M_EP]
             return loader
-        def _make_tp_loader_m_dim1():      # down：loaded [D, M] -> param [M_EP, D]
+
+        def _make_tp_loader_m_dim1():
             def loader(param, loaded_weight, expert_id=0):
                 w = loaded_weight.narrow(1, m_slice, M_EP)   # [D, M_EP]
                 param.data[expert_id].copy_(w.t())           # [M_EP, D]
             return loader
+
         self.stacked_gate_tp.weight_loader = _make_tp_loader_m_dim0()
-        self.stacked_up_tp.weight_loader   = _make_tp_loader_m_dim0()
+        self.stacked_up_tp.weight_loader = _make_tp_loader_m_dim0()
         self.stacked_down_tp.weight_loader = _make_tp_loader_m_dim1()
 
-        # moe_gemm 计算路径：finalize_moe() 之后就绪。
-        # _moe_weights 直接持有 stacked K-major 权重（w13/w2），不再有逐 expert 拷贝。
         self._moe_weights = None
-
-    # ------------------------------------------------------------------
-    # 计算路径（moe_gemm grouped GEMM）
-    # ------------------------------------------------------------------
 
     @property
     def moe_finalized(self) -> bool:
-        """finalize_moe() 是否已完成（幂等入口判断用）。"""
         return self._moe_weights is not None
 
     def finalize_moe(self):
-        """加载完成后、warmup 之前调用一次（幂等）。
+        """Build `MoEWeights` and free the HF-layout source parameters.
 
-        1. stacked_gate_tp/up_tp（已是 [E, H, M_EP]）→ w13 = cat(dim=2)
-           = [E, H, 2*M_EP]（gate 在前、up 在后，匹配 fused kernel 的
-           half = N//2 切分）→ MoEWeights；
-        2. 释放 HF 布局的源参数——EP=4 时每层约 302MB × 48 ≈ 14.5GB，权重出现
-           第二份副本会直接 OOM（32GB 卡）。
-
-        MoEWeights 直接持有 w13/down 的 stacked 张量，不再做逐 expert 转置
-        拷贝，也不再需要 b_ptrs 设备表。注意逐层 cat + 立即 del：若先收集所有
-        层的 cat 再统一释放，峰值会多出约 9.7GB。
+        Called once after loading and before warmup. Concatenate and release
+        layer by layer: collecting every layer's `w13` before freeing would
+        add about 9.7GB of peak memory.
         """
         if self._moe_weights is not None:
             return
-        w13 = torch.cat([self.stacked_gate_tp.data, self.stacked_up_tp.data], dim=2)
+        w13 = torch.cat(
+            [self.stacked_gate_tp.data, self.stacked_up_tp.data], dim=2)
         down = self.stacked_down_tp.data
         self._moe_weights = MoEWeights(w13, down)
         del self.stacked_gate_tp, self.stacked_up_tp, self.stacked_down_tp
-        del w13, down
-
-    def _moe_compute(self, hidden_states, topk_weights, topk_ids):
-        """单一路径：workspace 由 moe_forward 按实际路由行数现场分配。
-
-        capture 内分配落在图私有内存池，capture 外落在普通 caching allocator；
-        两者是同一段 Python 代码，不需要任何分支。
-        """
-        if self._moe_weights is None:
-            raise RuntimeError(
-                "MoE 计算路径需要先调用 finalize_moe()（加载完成后、warmup 前）")
-        return moe_forward(hidden_states, topk_weights, topk_ids, self._moe_weights)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Forward pass for MoE layer.
+        """Forward pass for the MoE layer."""
+        if self._moe_weights is None:
+            raise RuntimeError(
+                "MoE weights are not finalized; call finalize_moe() after "
+                "loading and before warmup")
 
-        Args:
-            hidden_states: [N, hidden_size] input token representations.
-
-        Returns:
-            [N, hidden_size] output after expert computation and merge.
-        """
         scores = self.gate(hidden_states)               # [N, num_experts]
         weights, indices = self._topk_routing(scores)   # [N, top_k] each
+        out = moe_forward(hidden_states, weights, indices, self._moe_weights)
 
-        out = self._moe_compute(hidden_states, weights, indices)
         if self.ep_size > 1:
-            # partial 求和（全组必须参与，含空输入——否则其他 rank 死锁）
+            # Every EP rank must join, including ranks with no tokens.
             get_ep_group().all_reduce(out)
         return out
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _topk_routing(self, scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _topk_routing(
+        self, scores: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Softmax + top-k routing.
 
-        Args:
-            scores: [N, num_experts] raw router logits.
-
-        Returns:
-            weights: [N, top_k] normalized routing weights.
-            indices: [N, top_k] selected expert indices (long).
+        Returns (weights [N, top_k], indices [N, top_k]).
         """
         orig_dtype = scores.dtype
         scores = F.softmax(scores, dim=-1, dtype=torch.float32)
