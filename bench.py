@@ -18,8 +18,12 @@ def parse_args():
     parser.add_argument("--dplb-method", default="ROUND_ROBIN",
                         help="DP load balancing: ROUND_ROBIN or LEAST_REQUESTS")
     parser.add_argument("--eager", action="store_true")
-    parser.add_argument("--async-scheduling", dest="async_scheduling", action="store_true",
-                        help="run-ahead scheduling (see Devlog/async_scheduling_plan.md)")
+    parser.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="run-ahead scheduling (default on; --no-async-scheduling for the sync baseline)")
+    parser.add_argument("--async-event-loop", action="store_true",
+                        help="DP threaded event loop; requires --no-async-scheduling "
+                             "(the two are mutually exclusive)")
     parser.add_argument("--arrival", type=int, default=0, metavar="N",
                         help="server-style: admit one request every N steps instead of one "
                              "offline batch (0 = offline; async scheduling's revenue case)")
@@ -37,6 +41,9 @@ def parse_args():
         parser.error("--arrival (step-driven) has no DP counterpart; use --arrival-ms")
     if args.arrival_ms and args.dp <= 1:
         parser.error("--arrival-ms requires --dp > 1")
+    if args.async_event_loop and args.async_scheduling:
+        parser.error("--async-event-loop requires --no-async-scheduling: "
+                     "async scheduling is not wired for the threaded event loop")
     return args
 
 
@@ -154,7 +161,8 @@ def main():
         os.environ["NANOVLLM_DP_DIAG_MODE"] = "invariants"
     llm = LLM(path, enforce_eager=args.eager, tensor_parallel_size=args.tp,
               data_parallel_size=args.dp, dplb_method=args.dplb_method,
-              max_model_len=4096, async_scheduling=args.async_scheduling)
+              max_model_len=4096, async_scheduling=args.async_scheduling,
+              async_event_loop=args.async_event_loop)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, args.max_input_len))]
                         for _ in range(num_seqs)]
@@ -162,7 +170,7 @@ def main():
                                       max_tokens=randint(100, args.max_output_len))
                        for _ in range(num_seqs)]
 
-    llm.generate(["Benchmark: "], SamplingParams())
+    llm.generate(["Benchmark: "], SamplingParams(), use_tqdm=False)
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
     if args.dp > 1:
         run_dp(args, llm, prompt_token_ids, sampling_params, total_tokens, diag_dir)

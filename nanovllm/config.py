@@ -27,7 +27,7 @@ class Config:
     data_parallel_size: int = 1
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
-    async_scheduling: bool = False      # run-ahead scheduling (gates: __post_init__)
+    async_scheduling: bool = True       # run-ahead scheduling (default on; gates: __post_init__)
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256

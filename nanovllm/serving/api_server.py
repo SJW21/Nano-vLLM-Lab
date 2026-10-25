@@ -334,20 +334,23 @@ def parse_args(argv=None):
     parser.add_argument("--dp", type=int, required=True, help="data parallel size")
     parser.add_argument("--port", type=int, required=True, help="listen port (127.0.0.1)")
     parser.add_argument("--max-model-len", dest="max_model_len", type=int, required=True)
-    parser.add_argument("--async-scheduling", dest="async_scheduling",
-                        action="store_true")
-    return parser.parse_args(argv)
+    parser.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="run-ahead scheduling (default on; --no-async-scheduling "
+                             "for the sync baseline)")
+    parser.add_argument("--async-event-loop", action="store_true",
+                        help="DP threaded event loop; requires --no-async-scheduling")
+    args = parser.parse_args(argv)
+    if args.async_event_loop and args.async_scheduling:
+        parser.error("--async-event-loop requires --no-async-scheduling: "
+                     "async scheduling is not wired for the threaded event loop")
+    return args
 
 
 def run_server(args):
-    # M7 guard: the DP sync event loop busy-spins (no idle poll), so online DP is
-    # accepted only in its async form. Fail before any engine work or socket bind.
-    if args.dp > 1:
-        assert args.async_scheduling, (
-            "online serving with data_parallel_size>1 requires async_scheduling=True: "
-            "the DP sync event loop busy-spins without an idle poll")
     print(f"[serving] model={args.model} tp={args.tp} dp={args.dp} "
-          f"port={args.port} async={args.async_scheduling}", flush=True)
+          f"port={args.port} async={args.async_scheduling} "
+          f"event_loop={args.async_event_loop}", flush=True)
 
     # uvicorn re-raises the captured signal after its graceful shutdown, before
     # `uvicorn.run` returns, so the code below the call never sees SIGTERM. The
@@ -362,7 +365,7 @@ def run_server(args):
 
     signal.signal(signal.SIGTERM, _on_sigterm)
     bridge = EngineBridge(args.model, args.tp, args.dp, args.max_model_len,
-                          args.async_scheduling)
+                          args.async_scheduling, args.async_event_loop)
     state["bridge"] = bridge
     app = create_app(bridge)
     try:

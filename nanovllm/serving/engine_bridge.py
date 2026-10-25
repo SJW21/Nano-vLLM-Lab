@@ -34,7 +34,8 @@ class _Request:
 class EngineBridge:
 
     def __init__(self, model: str, tensor_parallel_size: int, data_parallel_size: int,
-                 max_model_len: int, async_scheduling: bool):
+                 max_model_len: int, async_scheduling: bool,
+                 async_event_loop: bool = False):
         # Only the values the CLI can vary are passed; every other engine setting keeps
         # its Config default, which equals deployment_point.config.
         self._llm = LLM(
@@ -43,6 +44,7 @@ class EngineBridge:
             data_parallel_size=data_parallel_size,
             max_model_len=max_model_len,
             async_scheduling=async_scheduling,
+            async_event_loop=async_event_loop,
         )
         self.engine = self._llm._engine
         self.tokenizer = self.engine.tokenizer

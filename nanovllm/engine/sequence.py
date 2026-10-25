@@ -61,6 +61,9 @@ class Sequence:
         self.slot_id = -1
         self.pending = 0
         self.placeholder = False
+        # result-channel bookkeeping: run-ahead can consume an over-scheduled decode row
+        # after the sequence finished, so the first reporter marks it and later ones skip
+        self.reported = False
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -74,6 +77,16 @@ class Sequence:
     @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
+
+    def report_once(self) -> bool:
+        """Exactly-once gate for result channels: True the first time a finished
+        sequence is collected, False afterwards. Over-scheduled decode rows can still
+        contain a finished sequence; reporting it twice would double-count tokens (DP
+        ROUND_ROBIN) or break the client bookkeeping (DP LEAST_REQUESTS)."""
+        if not self.is_finished or self.reported:
+            return False
+        self.reported = True
+        return True
 
     @property
     def num_completion_tokens(self):
@@ -114,6 +127,7 @@ class Sequence:
 
     def __setstate__(self, state):
         self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.cached_state, self.mamba_state, self.snapshot_state, self.snapshot_pos, last_state, self.slot_id = state
+        self.reported = False
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

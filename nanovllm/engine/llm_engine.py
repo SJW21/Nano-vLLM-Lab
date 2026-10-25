@@ -88,7 +88,7 @@ class LLMEngine:
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.report_once()]
         return outputs, num_tokens
 
     def _step_async(self):
@@ -112,7 +112,7 @@ class LLMEngine:
             seqs, is_prefill, handle = to_consume
             token_ids = model_runner.wait_sample(handle)
             self.scheduler.postprocess(seqs, token_ids, is_prefill)
-            outputs += [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            outputs += [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.report_once()]
         # (3) schedule the next batch; a round with everything in flight returns nothing
         #     and finishes through the pipeline above
         seqs, is_prefill = self.scheduler.schedule()
