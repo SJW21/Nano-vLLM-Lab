@@ -14,9 +14,12 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
     "triton>=3.0.0",
-    "transformers>=4.51.0",
+    "transformers>=5.15.1,<=5.17.0",
     "flash-attn",
     "xxhash",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic>=2.6",
 ]
 
 [project.urls]

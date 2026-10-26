@@ -27,6 +27,7 @@ class Config:
     data_parallel_size: int = 1
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    async_scheduling: bool = True       # run-ahead scheduling (default on; gates: __post_init__)
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -68,3 +69,9 @@ class Config:
             self.num_full_layers = self.text_config.num_hidden_layers - self.num_linear_layers
         else:
             self.num_full_layers, self.num_linear_layers = self.text_config.num_hidden_layers, 0
+        if self.async_scheduling:
+            # unimplemented combinations: fail loudly rather than silently downgrade
+            # (decode snapshots need CPU-side per-step tokens, which async defers)
+            assert not self.enable_decode_snapshot, "async scheduling conflicts with decode snapshots"
+            assert not self.async_event_loop, \
+                "async scheduling is not wired for the threaded event loop (async_event_loop=True)"

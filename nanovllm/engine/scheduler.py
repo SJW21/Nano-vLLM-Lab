@@ -30,6 +30,13 @@ class Scheduler:
             "replay a data dependent write)"
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.async_scheduling = config.async_scheduling
+        # async scheduling: device slots into ModelRunner.token_of_slot, handed out at
+        # prefill and returned when the sequence finishes
+        self.slot_free = deque(range(config.max_num_seqs))
+        # sequences owned by an in-flight batch (they sit in no queue); is_finished()
+        # counts them
+        self.num_inflight = 0
 
     def plan_snapshot(self, seq: Sequence, is_decode: bool = False):
         """Ask for a state snapshot of this step, at the last complete block boundary it
@@ -56,7 +63,7 @@ class Scheduler:
             seq.snapshot_pos = pos
 
     def is_finished(self):
-        return not self.waiting and not self.running
+        return not self.waiting and not self.running and not self.num_inflight
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
@@ -68,6 +75,10 @@ class Scheduler:
         # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
+            if self.async_scheduling and seq.slot_id < 0 and not self.slot_free:
+                # the device-slot pool is global while this loop's cap is per batch:
+                # wait here until a finishing sequence hands a slot back
+                break
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
                 break
@@ -92,42 +103,77 @@ class Scheduler:
                     seq.num_scheduled_tokens = end - seq.num_cached_tokens
             self.plan_snapshot(seq)
             num_batched_tokens += seq.num_scheduled_tokens
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
-                seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
-                self.running.append(seq)
+            if self.async_scheduling and seq.slot_id < 0:
+                seq.slot_id = self.slot_free.popleft()
+            # the batch owns this sequence until postprocess commits it (to `running`,
+            # or back to `waiting` mid-chunk) -- what a prefill batch in flight means
+            self.waiting.popleft()
             scheduled_seqs.append(seq)
+            if seq.num_cached_tokens + seq.num_scheduled_tokens < seq.num_tokens:
+                # chunked prefill: one sequence per chunked batch (composition as before
+                # the ownership rework, which stopped here on the exhausted budget)
+                break
 
         if scheduled_seqs:
+            self.num_inflight += len(scheduled_seqs)
             return scheduled_seqs, True
 
         # decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
+            # async scheduling: if a sampling event is still in flight, this step's
+            # token is not in token_ids yet -- reserve its place now (postprocess fills
+            # it one step later) so the length/block math below is untouched
+            placeholder = self.async_scheduling and seq.pending > 0
+            if placeholder:
+                seq.token_ids.append(-1)
+                seq.num_tokens += 1
+                seq.placeholder = True
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
+                    if placeholder:     # roll the reservation back before it leaves
+                        seq.token_ids.pop()
+                        seq.num_tokens -= 1
+                        seq.placeholder = False
                     self.preempt(seq)
                     break
             else:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
+                if self.async_scheduling:
+                    seq.pending += 1
                 self.block_manager.may_append(seq)
                 self.plan_snapshot(seq, is_decode=True)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs or self.is_finished()
+        assert scheduled_seqs or self.is_finished() or self.num_inflight, \
+            "nothing scheduled and nothing in flight: the scheduler is stuck"
+        self.num_inflight += len(scheduled_seqs)
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
+        # reservations only live inside one schedule() call, so a preempted sequence
+        # never carries an unfilled placeholder; its in-flight token is dropped by
+        # postprocess (status != RUNNING)
+        assert not seq.placeholder
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+        self.num_inflight -= len(seqs)
         for seq, token_id in zip(seqs, token_ids):
+            if not is_prefill and seq.status is not SequenceStatus.RUNNING:
+                # the sequence finished or was preempted while this step was in flight:
+                # its sampled token is stale, drop it (a mid-chunk prefill is still
+                # legitimately WAITING here)
+                if seq.pending > 0:
+                    seq.pending -= 1
+                seq.num_scheduled_tokens = 0
+                continue
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
@@ -135,13 +181,32 @@ class Scheduler:
             # the block hashes are up to date
             self.block_manager.register_snapshot(seq)
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
-                # chunked prefill: the next chunk re-reads what this one wrote
+                # chunked prefill: the next chunk re-reads what this one wrote; the batch
+                # is done with the sequence, so it goes back to the queue it came from
                 self.block_manager.carry_state(seq)
+                self.waiting.appendleft(seq)
                 continue
             elif is_prefill:
                 self.block_manager.release_read_slot(seq)
-            seq.append_token(token_id)
+                # prefill committed: the sequence joins `running` here, before the finish
+                # check below, so a first-token-EOS sequence can be removed normally
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
+            if seq.placeholder:
+                # fill the reservation taken at schedule time in place, do not append
+                seq.token_ids[-1] = token_id
+                seq.last_token = token_id
+                seq.placeholder = False
+            else:
+                seq.append_token(token_id)
+            if seq.pending > 0:
+                seq.pending -= 1
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+                if self.async_scheduling and seq.slot_id >= 0:
+                    # safe right away: a still-in-flight scatter into this slot is ordered
+                    # before any new owner's write on the same stream
+                    self.slot_free.append(seq.slot_id)
+                    seq.slot_id = -1

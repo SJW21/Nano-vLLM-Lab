@@ -46,6 +46,11 @@ class LLMEngine:
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         self.profiler = Profiler(config)
+        # async scheduling pipeline: the batch prepared for the next launch, and the
+        # launched batch whose tokens are consumed one step later (both kinds of batch
+        # run through the same pipeline)
+        self._pending: tuple[list[Sequence], bool] | None = None
+        self._inflight: tuple[list[Sequence], bool, tuple[int, int]] | None = None
         atexit.register(self.exit)
 
     def exit(self):
@@ -54,7 +59,8 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams) -> int | None:
+        """Queue one request; returns its seq_id, or None when it was rejected."""
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         prompt_len = len(prompt)
@@ -73,13 +79,45 @@ class LLMEngine:
             return
         seq = Sequence(prompt, next(Sequence.counter), sampling_params)
         self.scheduler.add(seq)
+        return seq.seq_id
 
     def step(self):
+        if self.config.async_scheduling:
+            return self._step_async()
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.report_once()]
+        return outputs, num_tokens
+
+    def _step_async(self):
+        """Run-ahead step, uniform over prefill and decode: launch the batch prepared by
+        the previous call, then consume the one before it. The consume waits on work that
+        was enqueued a full step ago, so the GPU never idles on the D2H round trip."""
+        model_runner = self.model_runner
+        outputs = []
+        self._inflight, to_consume = None, self._inflight
+        # (1) launch the prepared batch (pure enqueue); num_tokens is this call's
+        #     throughput report, read before the consume below zeroes num_scheduled_tokens
+        num_tokens = 0
+        if self._pending is not None:
+            seqs, is_prefill = self._pending
+            num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+            method = "launch_prefill" if is_prefill else "launch_decode"
+            self._inflight = (seqs, is_prefill, model_runner.call(method, seqs))
+            self._pending = None
+        # (2) consume the previous call's launch, one step behind
+        if to_consume is not None:
+            seqs, is_prefill, handle = to_consume
+            token_ids = model_runner.wait_sample(handle)
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
+            outputs += [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.report_once()]
+        # (3) schedule the next batch; a round with everything in flight returns nothing
+        #     and finishes through the pipeline above
+        seqs, is_prefill = self.scheduler.schedule()
+        if seqs:
+            self._pending = (seqs, is_prefill)
         return outputs, num_tokens
 
     def is_finished(self):
@@ -116,6 +154,14 @@ class LLMEngine:
                 for seq_id, token_ids in output:
                     outputs[seq_id] = token_ids
                     pbar.update(1)
+            # safety net: is_finished() already counts in-flight batches, so this only
+            # iterates if something was still staged (drain it before collecting outputs)
+            while self._pending is not None or self._inflight is not None:
+                output, _ = self.step()
+                self.profiler.step()
+                for seq_id, token_ids in output:
+                    outputs[seq_id] = token_ids
+                    pbar.update(1)
         pbar.close()
         if self.failed:
             print(f"\n[WARNING] {len(self.failed)}/{len(prompts)} request(s) rejected:")
@@ -139,10 +185,11 @@ class DPLLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.dp_controller = DataParallelController(config)
-        self.seqm = SequenceManager()        
+        self.seqm = SequenceManager()
         atexit.register(self.exit)
     
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams) -> int | None:
+        """Queue one request; returns its seq_id, or None when it was rejected."""
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         prompt_len = len(prompt)
@@ -161,6 +208,7 @@ class DPLLMEngine:
             return
         seq = TokenizedInput(prompt, self.seqm.get_id, sampling_params)
         self.dp_controller.dispatcher(seq)
+        return seq.seq_id
 
     def generate(
         self,

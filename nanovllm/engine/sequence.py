@@ -55,6 +55,15 @@ class Sequence:
         # step so every rank writes the same slot (both -1 => no snapshot)
         self.snapshot_state = -1
         self.snapshot_pos = -1
+        # async scheduling bookkeeping (see Scheduler.schedule / postprocess): slot_id
+        # is this sequence's row in ModelRunner.token_of_slot, `pending` counts in-flight
+        # decode steps, `placeholder` marks a reserved (unfilled) token_ids[-1]
+        self.slot_id = -1
+        self.pending = 0
+        self.placeholder = False
+        # result-channel bookkeeping: run-ahead can consume an over-scheduled decode row
+        # after the sequence finished, so the first reporter marks it and later ones skip
+        self.reported = False
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -68,6 +77,16 @@ class Sequence:
     @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
+
+    def report_once(self) -> bool:
+        """Exactly-once gate for result channels: True the first time a finished
+        sequence is collected, False afterwards. Over-scheduled decode rows can still
+        contain a finished sequence; reporting it twice would double-count tokens (DP
+        ROUND_ROBIN) or break the client bookkeeping (DP LEAST_REQUESTS)."""
+        if not self.is_finished or self.reported:
+            return False
+        self.reported = True
+        return True
 
     @property
     def num_completion_tokens(self):
@@ -101,11 +120,14 @@ class Sequence:
         self.snapshot_pos = -1
 
     def __getstate__(self):
+        # decode ships only last_token (a worker never reads the full list back) and
+        # slot_id travels, so every rank scatters into the same token_of_slot row
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.cached_state, self.mamba_state, self.snapshot_state, self.snapshot_pos, last_state)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.cached_state, self.mamba_state, self.snapshot_state, self.snapshot_pos, last_state, self.slot_id)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.cached_state, self.mamba_state, self.snapshot_state, self.snapshot_pos, last_state = state
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, self.cached_state, self.mamba_state, self.snapshot_state, self.snapshot_pos, last_state, self.slot_id = state
+        self.reported = False
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
